@@ -1,0 +1,11 @@
+*.txt
+*.json
+*.jsonl
+*.duckdb
+*.db
+.env
+*.pyc
+__pycache__/
+real/all_found_tx.jsonl
+/out
+/python

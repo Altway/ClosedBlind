@@ -1,0 +1,30 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+web3 = "*"
+requests = "*"
+eth-abi = "*"
+fpdf = "*"
+pandas = "*"
+plotly = "*"
+kaleido = "*"
+seaborn = "*"
+matplotlib = "*"
+numba = "*"
+duckdb = "*"
+tenacity = "*"
+duckdb-engine = "*"
+sqlalchemy = "*"
+dask = "*"
+python-dotenv = "*"
+
+[dev-packages]
+ipykernel = "*"
+jupyterlab = "*"
+ipython = "*"
+
+[requires]
+python_version = "3.12"
