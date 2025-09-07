@@ -8,9 +8,13 @@ web3 = "*"
 requests = "*"
 eth-abi = "*"
 python-dotenv = "*"
+fpdf = "*"
+matplotlib = "*"
 
 [dev-packages]
 ipykernel = "*"
+jupyterlab = "*"
+ipython = "*"
 
 [requires]
 python_version = "3.12"

@@ -44,7 +44,8 @@ w3 = Web3(
 CONTRACT_ADDRESS = "0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95"
 CONTRACT_ADDRESS = contract_address = w3.to_checksum_address(CONTRACT_ADDRESS)
 ETHERSCAN_API_KEY = "F7K9BTHSSB9EQT9WEGHMG3VFJ54KA8RM1K"
-EVENTS_FILE = "../out/deployer_v1_events.json"
+# EVENTS_FILE = "../out/deployer_v1_events.json"
+EVENTS_FILE = "../out/Liquidity_v1_events.json"
 ABI_FILE = "../out/Uniswap_deployer_v1.json"
 GENESIS_CONTRACT_BLOCK = 6627956
 CHUNK_SIZE = 10000
@@ -445,4 +446,7 @@ def process_events(event_type_list):
 # -----------------------
 # Run the Processing
 # -----------------------
-process_events(["NewExchange"])
+# %%
+process_events(["AddLiquidity", "RemoveLiquidity"])
+
+# %%
