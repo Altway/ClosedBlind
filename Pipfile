@@ -10,6 +10,7 @@ eth-abi = "*"
 python-dotenv = "*"
 fpdf = "*"
 matplotlib = "*"
+pandas = "*"
 
 [dev-packages]
 ipykernel = "*"
