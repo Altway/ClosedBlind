@@ -23,3 +23,12 @@ On ne peut pas directement, il faut recouper le token renvoye par le SM (celui q
 
 - chiant de devoir utiliser ETHERSCAN
 - l'exchange BNB est un peu naze, tres peu de liquidite
+
+-----------------------------------------------------
++ additionnal ETHERSCAN API KEY
++ Function de crawling des block pour les interactions avec le smartcontract mais hit 429/402 apres quelques blocks
+
+-> fonction de plot AI generated, it's a mess we need to clean that
+-> il y a des subtilite avec la qty d'ETH dans le smartcontract et la qty d'ETH de la pool, il faut faire un peu d'analyze pour avoir tout clean
+-> regarde la derniere cell et re-decompose, c'est IA generated il faut s'approprier ce code
+==> il faut compute les liquidites/les addresses

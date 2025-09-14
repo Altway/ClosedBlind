@@ -11,6 +11,7 @@ python-dotenv = "*"
 fpdf = "*"
 matplotlib = "*"
 pandas = "*"
+plotly = "*"
 
 [dev-packages]
 ipykernel = "*"
