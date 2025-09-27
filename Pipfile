@@ -9,9 +9,11 @@ requests = "*"
 eth-abi = "*"
 python-dotenv = "*"
 fpdf = "*"
-matplotlib = "*"
 pandas = "*"
 plotly = "*"
+kaleido = "*"
+seaborn = "*"
+matplotlib = "*"
 
 [dev-packages]
 ipykernel = "*"
