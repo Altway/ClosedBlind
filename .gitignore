@@ -3,3 +3,4 @@
 .env
 *.pyc
 __pycache__/
+real/all_found_tx.jsonl
