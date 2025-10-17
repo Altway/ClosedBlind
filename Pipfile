@@ -18,7 +18,6 @@ duckdb = "*"
 tenacity = "*"
 duckdb-engine = "*"
 sqlalchemy = "*"
-dask = "*"
 python-dotenv = "*"
 
 [dev-packages]
