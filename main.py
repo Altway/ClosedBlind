@@ -6,35 +6,25 @@ import logging
 import os
 import time
 import traceback
-import datetime
 import tempfile
 import threading
 import duckdb
 import requests
-from datetime import timezone
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal
 
-import numpy as np
 import pandas as pd
-
 import plotly.express as px
 import plotly.graph_objects as go
+
 from plotly.subplots import make_subplots
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
-from hexbytes import HexBytes
 from requests.exceptions import HTTPError, ConnectionError
-
 from web3 import Web3
+from web3.exceptions import Web3RPCError
 from web3.providers.rpc.utils import (
     ExceptionRetryConfiguration,
     REQUEST_RETRY_ALLOWLIST,
 )
-from web3.exceptions import Web3RPCError
-
-from python.ethscan_main import POOL_ADDRESS
 
 # Configuration
 load_dotenv()
@@ -63,10 +53,12 @@ ETHERSCAN_API_KEY_DICT = {
 
 ETHERSCAN_API_KEY = ETHERSCAN_API_KEY_DICT["hearthquake"]["ETHERSCAN_API_KEY"]
 UNISWAP_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+FACTORY_DEPLOYMENT_BLOCK = 12369621
 STATE_FILE = "out/V3/V3_final_scan_state.json"
 TOKEN_NAME_FILE = "out/V3/V3_token_name.json"
 V3_EVENT_BY_CONTRACTS = "out/V3/uniswap_v3_pairs_events.json"
 DB_PATH = "out/V3/uniswap_v3.duckdb"
+V3_POOL_LIST_FILE = "out/V3/uniswap_v3_pairs_events.json"
 ABI_CACHE_FOLDER = "ABI"
 
 
@@ -143,21 +135,19 @@ class ABICache:
 
 
 class DuckDBConnectionPool:
-    def __init__(self, db_pool):
-        self.db_pool = db_pool
+    def __init__(self, db_path):
+        self.db_path = db_path
         self.connections = {}
         self.lock = threading.Lock()
 
     def get_connection(self):
         thread_id = threading.get_ident()
-
         with self.lock:
             if thread_id not in self.connections:
-                conn = duckdb.connect(self.db_pool)
+                conn = duckdb.connect(self.db_path)
                 self.connections[thread_id] = conn
                 logging.debug(f"Created DB connection for thread {thread_id}")
-
-            return self.connections[thread_id]
+        return self.connections[thread_id]
 
     def close_all(self):
         with self.lock:
@@ -169,12 +159,10 @@ class DuckDBConnectionPool:
                     logging.warning(
                         f"Error closing connection for thread {thread_id}: {e}"
                     )
-
             self.connections.clear()
 
     def close_current_thread(self):
         thread_id = threading.get_ident()
-
         with self.lock:
             if thread_id in self.connections:
                 try:
@@ -227,10 +215,7 @@ class TokenCache:
 
 
 TOKEN_CACHE = TokenCache()
-
-DB_POOL = None
 ABI_CACHE = ABICache()
-
 PROVIDER_POOL = ProviderPool(ETHERSCAN_API_KEY_DICT)
 w3, _ = PROVIDER_POOL.get_provider()
 assert w3.is_connected(), "Web3 provider connection failed"
@@ -261,15 +246,17 @@ def get_abi(contract_address, api_key=ETHERSCAN_API_KEY, abi_folder=ABI_CACHE_FO
         try:
             with open(filename, "r") as f:
                 abi = json.load(f)
-                if abi is None or abi == []:
-                    raise ABINotVerified(
-                        f"Contract {contract_address} not verified (cached)"
-                    )
-                return abi
+            if abi is None or abi == []:
+                raise ABINotVerified(
+                    f"Contract {contract_address} not verified (cached)"
+                )
+            return abi
         except json.JSONDecodeError as e:
             logging.warning(
                 f"Corrupted ABI cache for {contract_address}: {e}, re-fetching..."
             )
+
+    time.sleep(0.25)
 
     try:
         url = f"https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address={contract_address}&apikey={api_key}"
@@ -279,44 +266,34 @@ def get_abi(contract_address, api_key=ETHERSCAN_API_KEY, abi_folder=ABI_CACHE_FO
 
         if data["status"] == "1":
             abi = json.loads(data["result"])
-
             if not isinstance(abi, list) or len(abi) == 0:
                 logging.warning(f"Empty ABI for {contract_address}")
                 raise ABINotVerified(f"Empty ABI returned")
-
             with open(filename, "w") as f:
                 json.dump(abi, f, indent=2)
             return abi
-
         else:
             error_msg = data.get("result", "Unknown error")
-
             if "not verified" in error_msg.lower():
                 with open(filename, "w") as f:
                     json.dump(None, f)
                 raise ABINotVerified(f"Contract not verified: {error_msg}")
-
             elif (
                 "rate limit" in error_msg.lower()
                 or "max rate limit" in error_msg.lower()
             ):
                 raise ABIRateLimited(f"Etherscan rate limit: {error_msg}")
-
             else:
                 logging.error(
                     f"Etherscan API error for {contract_address}: {error_msg}"
                 )
                 raise ABIFetchError(f"Etherscan error: {error_msg}")
-
     except requests.Timeout:
         raise ABINetworkError(f"Timeout fetching ABI for {contract_address}")
-
     except requests.ConnectionError as e:
         raise ABINetworkError(f"Connection error: {e}")
-
     except requests.RequestException as e:
         raise ABINetworkError(f"Request failed: {e}")
-
     except (json.JSONDecodeError, KeyError) as e:
         raise ABIFetchError(f"Invalid response format: {e}")
 
@@ -414,67 +391,34 @@ def get_contract_with_fallback(
         raise
 
 
-def validate_abi_has_functions(abi, required_functions):
-    if not abi or not isinstance(abi, list):
-        return False, "Invalid ABI structure"
-
-    available_functions = [
-        item.get("name") for item in abi if item.get("type") == "function"
-    ]
-
-    missing = [fn for fn in required_functions if fn not in available_functions]
-
-    if missing:
-        return False, f"Missing functions: {missing}"
-
-    return True, available_functions
+EVENT_SIGNATURE_CACHE = {}
+EVENT_CACHE_LOCK = threading.Lock()
 
 
-def decode_topics(log):
-    provider, _ = PROVIDER_POOL.get_provider()
-    abi, contract = ABI_CACHE.get_contract(log["address"], provider)
+def get_event_signature_map(contract_address, abi):
+    with EVENT_CACHE_LOCK:
+        if contract_address in EVENT_SIGNATURE_CACHE:
+            return EVENT_SIGNATURE_CACHE[contract_address]
 
-    if not abi or not contract:
-        return {}
-
-    for item in abi:
-        if item.get("type") == "event":
-            event_signature = (
-                f'{item["name"]}({",".join(i["type"] for i in item["inputs"])})'
-            )
-            event_hash = w3.keccak(text=event_signature).hex()
-            if log["topics"][0].hex() == event_hash:
-                try:
-                    decoded = contract.events[item["name"]]().process_log(log)
-                    return {
-                        "event": item["name"],
-                        "args": dict(decoded["args"]),
-                    }
-                except Exception as e:
-                    logging.debug(f"Failed to decode event {item['name']}: {e}")
-                    return {}
-
-    return {}
+        event_map = build_event_signature_map(abi)
+        EVENT_SIGNATURE_CACHE[contract_address] = event_map
+        return event_map
 
 
-_thread_local = threading.local()
-
-
-def setup_database(db_path, db_pool):
-    conn = duckdb.connect(db_pool)
-    with open(db_path, "r") as f:
+def setup_database(db_path=DB_PATH, schema_path="./out/V3/database/schema.sql"):
+    conn = duckdb.connect(db_path)
+    with open(schema_path, "r") as f:
         schema_sql = f.read()
     conn.execute(schema_sql)
     conn.close()
-
-    db_pool = DuckDBConnectionPool(db_pool)
-
     logging.info("✓ Database schema created successfully")
+    return DuckDBConnectionPool(db_path)
 
-    return db_pool
+
+DB_POOL = setup_database()
 
 
-def batch_insert_events(events, db_pool, worker_id="main"):
+def batch_insert_events(events, worker_id="main"):
     if not events:
         return 0
 
@@ -502,7 +446,6 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                     int(args.get("value", 0)),
                 )
             )
-
         elif event_type == "Swap":
             swaps.append(
                 (
@@ -519,7 +462,6 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                     int(args.get("tick", 0)),
                 )
             )
-
         elif event_type == "Mint":
             mints.append(
                 (
@@ -536,7 +478,6 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                     int(args.get("amount1", 0)),
                 )
             )
-
         elif event_type == "Burn":
             burns.append(
                 (
@@ -552,7 +493,6 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                     int(args.get("amount1", 0)),
                 )
             )
-
         elif event_type == "Collect":
             collects.append(
                 (
@@ -568,7 +508,6 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                     int(args.get("amount1", 0)),
                 )
             )
-
         elif event_type == "Flash":
             flashes.append(
                 (
@@ -584,7 +523,6 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                     int(args.get("paid1", 0)),
                 )
             )
-
         elif event_type == "Approval":
             approvals.append(
                 (
@@ -598,93 +536,78 @@ def batch_insert_events(events, db_pool, worker_id="main"):
                 )
             )
 
-    conn = db_pool.get_connection()
-    conn.execute("BEGIN TRANSACTION")
+    conn = DB_POOL.get_connection()
 
     try:
         if transfers:
             conn.executemany(
                 """
-                INSERT INTO transfer 
-                (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value)
+                INSERT INTO transfer (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 transfers,
             )
 
         if swaps:
             conn.executemany(
                 """
-                INSERT INTO swap 
-                (transaction_hash, log_index, block_number, pair_address, sender, recipient, 
-                 amount0, amount1, sqrt_price_x96, liquidity, tick)
+                INSERT INTO swap (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 swaps,
             )
 
         if mints:
             conn.executemany(
                 """
-                INSERT INTO mint 
-                (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper,
-                 sender, amount, amount0, amount1)
+                INSERT INTO mint (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, sender, amount, amount0, amount1)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 mints,
             )
 
         if burns:
             conn.executemany(
                 """
-                INSERT INTO burn 
-                (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper,
-                 amount, amount0, amount1)
+                INSERT INTO burn (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, amount, amount0, amount1)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 burns,
             )
 
         if collects:
             conn.executemany(
                 """
-                INSERT INTO collect 
-                (transaction_hash, log_index, block_number, pair_address, owner, recipient,
-                 tick_lower, tick_upper, amount0, amount1)
+                INSERT INTO collect (transaction_hash, log_index, block_number, pair_address, owner, recipient, tick_lower, tick_upper, amount0, amount1)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 collects,
             )
 
         if flashes:
             conn.executemany(
                 """
-                INSERT INTO flash 
-                (transaction_hash, log_index, block_number, pair_address, sender, recipient,
-                 amount0, amount1, paid0, paid1)
+                INSERT INTO flash (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, paid0, paid1)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 flashes,
             )
 
         if approvals:
             conn.executemany(
                 """
-                INSERT INTO approval 
-                (transaction_hash, log_index, block_number, pair_address, owner, spender, value)
+                INSERT INTO approval (transaction_hash, log_index, block_number, pair_address, owner, spender, value)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (transaction_hash, log_index) DO NOTHING
-                """,
+            """,
                 approvals,
             )
-
-        conn.execute("COMMIT")
 
         total = (
             len(transfers)
@@ -705,13 +628,12 @@ def batch_insert_events(events, db_pool, worker_id="main"):
         return total
 
     except Exception as e:
-        conn.execute("ROLLBACK")
-        logging.error(f"[{worker_id}] batch_insert_events failed: {e}", exc_info=True)
+        logging.error(f"[{worker_id}] batch_insert_events failed: {e}")
         raise
 
 
-def mark_range_completed(start_block, end_block, db_pool, worker_id="main"):
-    conn = db_pool.get_connection()
+def mark_range_completed(start_block, end_block, worker_id="main"):
+    conn = DB_POOL.get_connection()
     conn.execute(
         """
         INSERT INTO processing_state (start_block, end_block, status, worker_id, updated_at)
@@ -726,8 +648,8 @@ def mark_range_completed(start_block, end_block, db_pool, worker_id="main"):
     )
 
 
-def mark_range_processing(start_block, end_block, db_pool, worker_id="main"):
-    conn = db_pool.get_connection()
+def mark_range_processing(start_block, end_block, worker_id="main"):
+    conn = DB_POOL.get_connection()
     conn.execute(
         """
         INSERT INTO processing_state (start_block, end_block, status, worker_id, updated_at)
@@ -742,8 +664,8 @@ def mark_range_processing(start_block, end_block, db_pool, worker_id="main"):
     )
 
 
-def get_completed_ranges(db_pool):
-    conn = db_pool.get_connection()
+def get_completed_ranges():
+    conn = DB_POOL.get_connection()
     result = conn.execute(
         """
         SELECT start_block, end_block 
@@ -754,8 +676,8 @@ def get_completed_ranges(db_pool):
     return set((r[0], r[1]) for r in result)
 
 
-def get_database_stats(db_pool):
-    conn = db_pool.get_connection()
+def get_database_stats():
+    conn = DB_POOL.get_connection()
     result = conn.execute(
         """
         SELECT 
@@ -790,7 +712,6 @@ def insert_pair_metadata(
     pair_address,
     token0_address,
     token1_address,
-    db_pool,
     token0_symbol=None,
     token1_symbol=None,
     token0_decimals=None,
@@ -799,7 +720,7 @@ def insert_pair_metadata(
     tick_spacing=None,
     created_block=None,
 ):
-    conn = db_pool.get_connection()
+    conn = DB_POOL.get_connection()
     conn.execute(
         """
         INSERT INTO pair_metadata 
@@ -830,8 +751,8 @@ def insert_pair_metadata(
     )
 
 
-def get_pair_metadata(pair_address, db_pool):
-    conn = db_pool.get_connection()
+def get_pair_metadata(pair_address):
+    conn = DB_POOL.get_connection()
     result = conn.execute(
         """
         SELECT token0_address, token1_address, token0_symbol, token1_symbol,
@@ -857,11 +778,11 @@ def get_pair_metadata(pair_address, db_pool):
     return None
 
 
-def batch_insert_block_metadata(blocks_data, db_pool):
+def batch_insert_block_metadata(blocks_data):
     if not blocks_data:
         return 0
 
-    conn = db_pool.get_connection()
+    conn = DB_POOL.get_connection()
     conn.executemany(
         """
         INSERT INTO block_metadata (block_number, block_timestamp, block_hash)
@@ -873,8 +794,8 @@ def batch_insert_block_metadata(blocks_data, db_pool):
     return len(blocks_data)
 
 
-def normalize_values_for_pair(pair_address, db_pool):
-    metadata = get_pair_metadata(pair_address, db_pool)
+def normalize_values_for_pair(pair_address):
+    metadata = get_pair_metadata(pair_address)
 
     if (
         not metadata
@@ -888,7 +809,7 @@ def normalize_values_for_pair(pair_address, db_pool):
     token0_decimals = metadata["token0_decimals"]
     token1_decimals = metadata["token1_decimals"]
 
-    conn = db_pool.get_connection()
+    conn = DB_POOL.get_connection()
 
     conn.execute(
         """
@@ -1127,28 +1048,69 @@ def fetch_block_metadata(block_number, provider=None, retry_count=0, max_retries
         return None
 
 
-def fetch_and_store_uniswap_pair_metadata(
-    pair_address, db_pool, created_block=None, provider=None, max_retries=3
+def generate_v3_pool_list(
+    output_file=V3_POOL_LIST_FILE, start_block=FACTORY_DEPLOYMENT_BLOCK
 ):
-    existing = get_pair_metadata(pair_address, db_pool)
+    """
+    Fetch all V3 pool addresses from PoolCreated events and save to a simple text file
+    """
+    if os.path.exists(output_file):
+        logging.info(f"✓ Pool list already exists: {output_file}")
+        with open(output_file, "r") as f:
+            pools = [line.strip() for line in f if line.strip()]
+        logging.info(f"Loaded {len(pools)} V3 pools from file")
+        return pools
+
+    logging.info("Generating V3 pool list from PoolCreated events...")
+    provider, _ = PROVIDER_POOL.get_provider()
+
+    # Use existing ABI fetching system
+    factory_abi = get_abi(UNISWAP_V3_FACTORY)
+    factory_contract = provider.eth.contract(
+        address=UNISWAP_V3_FACTORY, abi=factory_abi
+    )
+
+    current_block = provider.eth.block_number
+    chunk_size = 10000
+    pools = set()
+
+    for from_block in range(start_block, current_block + 1, chunk_size):
+        to_block = min(from_block + chunk_size - 1, current_block)
+        try:
+            logs = factory_contract.events.PoolCreated.get_logs(
+                from_block=from_block, to_block=to_block
+            )
+            for log in logs:
+                pools.add(log.args.pool)
+            if logs:
+                logging.info(
+                    f"[{from_block:,} - {to_block:,}] Found {len(logs)} pools | Total: {len(pools):,}"
+                )
+        except Exception as e:
+            logging.warning(f"Error fetching pools at block {from_block:,}: {e}")
+            time.sleep(1)
+            continue
+
+    pools = sorted(pools)
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w") as f:
+        for pool in pools:
+            f.write(f"{pool}\n")
+
+    logging.info(f"✓ Saved {len(pools)} V3 pools to {output_file}")
+    return pools
+
+
+def fetch_and_store_uniswap_pair_metadata(
+    pair_address, created_block=None, provider=None, max_retries=3
+):
+    existing = get_pair_metadata(pair_address)
     if existing and existing["token0_decimals"] is not None:
         logging.debug(f"Using cached metadata for {pair_address[:10]}")
         return existing
 
     if provider is None:
         provider, _ = PROVIDER_POOL.get_provider()
-
-    is_valid, validation_result = validate_uniswap_v3_pool(pair_address, provider)
-    if not is_valid:
-        logging.error(f"Skipping invalid pool {pair_address}: {validation_result}")
-        insert_pair_metadata(
-            pair_address=pair_address,
-            token0_address=None,
-            token1_address=None,
-            db_pool=db_pool,
-            created_block=created_block,
-        )
-        return None
 
     # Retry logic
     for attempt in range(max_retries):
@@ -1160,7 +1122,6 @@ def fetch_and_store_uniswap_pair_metadata(
                     pair_address=metadata["pair_address"],
                     token0_address=metadata["token0_address"],
                     token1_address=metadata["token1_address"],
-                    db_pool=db_pool,
                     token0_symbol=metadata.get("token0_symbol"),
                     token1_symbol=metadata.get("token1_symbol"),
                     token0_decimals=metadata.get("token0_decimals"),
@@ -1206,9 +1167,7 @@ def fetch_and_store_uniswap_pair_metadata(
     return None
 
 
-def fetch_and_store_block_metadata(
-    block_numbers, db_pool, provider=None, max_workers=8
-):
+def fetch_and_store_block_metadata(block_numbers, provider=None, max_workers=8):
     provider_name = "provided"
     if provider is None:
         provider, provider_name = PROVIDER_POOL.get_provider()
@@ -1231,7 +1190,7 @@ def fetch_and_store_block_metadata(
                 logging.error(f"Failed to fetch block {block_num}: {e}")
 
     if blocks_data:
-        batch_insert_block_metadata(blocks_data, db_pool)
+        batch_insert_block_metadata(blocks_data)
         logging.info(
             f"✓ Stored metadata for {len(blocks_data)} blocks using {provider_name}"
         )
@@ -1239,15 +1198,26 @@ def fetch_and_store_block_metadata(
     return len(blocks_data)
 
 
-def collect_missing_pair_metadata(
-    db_pool, batch_size=100, provider=None, max_workers=12
-):
-    conn = db_pool.get_connection()
+def collect_missing_pair_metadata(batch_size=100, provider=None, max_workers=12):
+    conn = DB_POOL.get_connection()
 
     all_pairs = conn.execute(
         """
-        SELECT DISTINCT pair_address FROM transfer
-        """
+        SELECT DISTINCT pair_address FROM (
+            SELECT DISTINCT pair_address FROM transfer
+            UNION
+            SELECT DISTINCT pair_address FROM swap
+            UNION
+            SELECT DISTINCT pair_address FROM mint
+            UNION
+            SELECT DISTINCT pair_address FROM burn
+            UNION
+            SELECT DISTINCT pair_address FROM collect
+            UNION
+            SELECT DISTINCT pair_address FROM flash
+        )
+        WHERE pair_address IS NOT NULL
+    """
     ).fetchall()
     all_pairs = [r[0] for r in all_pairs]
 
@@ -1255,7 +1225,7 @@ def collect_missing_pair_metadata(
         """
         SELECT pair_address FROM pair_metadata
         WHERE token0_decimals IS NOT NULL AND token1_decimals IS NOT NULL
-        """
+    """
     ).fetchall()
     existing_pairs = set(r[0] for r in existing_pairs)
 
@@ -1284,7 +1254,7 @@ def collect_missing_pair_metadata(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_pair = {
                 executor.submit(
-                    fetch_and_store_uniswap_pair_metadata, pair, db_pool, None, provider
+                    fetch_and_store_uniswap_pair_metadata, pair, None, provider
                 ): pair
                 for pair in batch
             }
@@ -1314,8 +1284,8 @@ def collect_missing_pair_metadata(
     )
 
 
-def normalize_missing_pairs(db_pool, max_workers=8):
-    conn = db_pool.get_connection()
+def normalize_missing_pairs(max_workers=8):
+    conn = DB_POOL.get_connection()
 
     pairs_with_metadata = conn.execute(
         """
@@ -1353,7 +1323,7 @@ def normalize_missing_pairs(db_pool, max_workers=8):
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_pair = {
-            executor.submit(normalize_values_for_pair, pair, db_pool): pair
+            executor.submit(normalize_values_for_pair, pair): pair
             for pair in pairs_to_normalize
         }
 
@@ -1374,9 +1344,9 @@ def normalize_missing_pairs(db_pool, max_workers=8):
 
 
 def populate_block_metadata_for_range(
-    start_block, end_block, db_pool, batch_size=1000, provider=None, max_workers=8
+    start_block, end_block, batch_size=1000, provider=None, max_workers=8
 ):
-    conn = db_pool.get_connection()
+    conn = DB_POOL.get_connection()
 
     existing_blocks = conn.execute(
         """
@@ -1398,17 +1368,75 @@ def populate_block_metadata_for_range(
 
     for i in range(0, len(missing_blocks), batch_size):
         batch = missing_blocks[i : i + batch_size]
-        fetch_and_store_block_metadata(batch, db_pool, provider, max_workers)
+        fetch_and_store_block_metadata(batch, provider, max_workers)
         logging.info(
             f"Progress: {min(i + batch_size, len(missing_blocks))}/{len(missing_blocks)} blocks processed"
         )
 
 
 # In[11]:
+def build_event_signature_map(abi):
+    event_map = {}
+    for item in abi:
+        if item.get("type") == "event":
+            event_signature = (
+                f'{item["name"]}({",".join(i["type"] for i in item["inputs"])})'
+            )
+            event_hash = w3.keccak(text=event_signature).hex()
+            event_map[event_hash] = item["name"]
+    return event_map
 
 
-def get_all_unique_pairs_from_db(db_pool):
-    conn = db_pool.get_connection()
+def create_transaction_dict(log, provider, topics):
+    transaction = {
+        "transactionHash": provider.to_hex(log["transactionHash"]),
+        "blockNumber": log["blockNumber"],
+        "logIndex": log.get("logIndex", 0),
+        "address": log["address"],
+        "data": provider.to_hex(log["data"]),
+    }
+
+    transaction.update(topics)
+
+    return transaction
+
+
+def decode_logs_for_contract(contract_address, logs, provider):
+    abi, contract = ABI_CACHE.get_contract(contract_address, provider)
+
+    if not abi or not contract:
+        return [create_transaction_dict(log, provider, {}) for log in logs]
+
+    event_map = get_event_signature_map(contract_address, abi)
+
+    transactions = []
+    for log in logs:
+        if log.get("topics") and len(log["topics"]) > 0:
+            event_signature_hash = log["topics"][0].hex()
+
+            if event_signature_hash in event_map:
+                event_name = event_map[event_signature_hash]
+                try:
+                    decoded = contract.events[event_name]().process_log(log)
+                    topics = {
+                        "event": event_name,
+                        "args": dict(decoded["args"]),
+                    }
+                except Exception as e:
+                    logging.debug(f"Failed to decode event {event_name}: {e}")
+                    topics = {}
+            else:
+                topics = {}
+        else:
+            topics = {}
+
+        transactions.append(create_transaction_dict(log, provider, topics))
+
+    return transactions
+
+
+def get_all_unique_pairs_from_db():
+    conn = DB_POOL.get_connection()
     result = conn.execute(
         """
         SELECT DISTINCT pair_address 
@@ -1433,35 +1461,33 @@ def fetch_logs_for_range(
 
         logs = provider.eth.get_logs(params)
 
-        transactions = []
+        # Group logs by contract address
+        logs_by_address = {}
         for log in logs:
-            transaction = {
-                "transactionHash": provider.to_hex(log["transactionHash"]),
-                "blockNumber": log["blockNumber"],
-                "logIndex": log.get("logIndex", 0),
-                "address": log["address"],
-                "data": provider.to_hex(log["data"]),
-            }
+            addr = log["address"]
+            if addr not in logs_by_address:
+                logs_by_address[addr] = []
+            logs_by_address[addr].append(log)
 
-            topics = decode_topics(log)
-            transaction.update(topics)
-
-            transaction["eventSignature"] = ""
-            if log.get("topics") and len(log["topics"]) > 0:
-                transaction["eventSignature"] = provider.to_hex(log["topics"][0])
-
-            transactions.append(transaction)
+        # Decode logs grouped by address
+        transactions = []
+        for contract_address, contract_logs in logs_by_address.items():
+            decoded_logs = decode_logs_for_contract(
+                contract_address, contract_logs, provider
+            )
+            transactions.extend(decoded_logs)
 
         logging.info(
-            f"[{worker_id}] [{provider_name}] Fetched {len(transactions)} events from blocks [{start_block:,}, {end_block:,}]"
+            f"[{worker_id}] [{provider_name}] Fetched {len(transactions)} events from blocks [{start_block:,} - {end_block:,}]"
         )
+
         return transactions
 
     except HTTPError as e:
         if e.response.status_code == 413:
             # Response too large - need to split the range
             logging.warning(
-                f"[{worker_id}] [{provider_name}] Response too large (413) for range [{start_block:,}, {end_block:,}] - will split"
+                f"[{worker_id}] [{provider_name}] Response too large (413) for range [{start_block:,} - {end_block:,}] - will split"
             )
             raise Web3RPCError("Response payload too large - splitting range")
 
@@ -1505,7 +1531,7 @@ def fetch_logs_for_range(
 
 
 def collect_block_metadata_for_range(start_block, end_block, worker_id="main"):
-    conn = db_pool.get_connection()
+    conn = DB_POOL.get_connection()
 
     existing_blocks = conn.execute(
         """
@@ -1533,107 +1559,76 @@ def collect_block_metadata_for_range(start_block, end_block, worker_id="main"):
             logging.warning(f"[{worker_id}] Failed to fetch block {block_num}: {e}")
 
     if blocks_data:
-        batch_insert_block_metadata(blocks_data, db_pool)
+        batch_insert_block_metadata(blocks_data)
         logging.debug(f"[{worker_id}] Stored metadata for {len(blocks_data)} blocks")
 
     return len(blocks_data)
 
 
-def collect_pair_metadata_from_events(events, worker_id="main"):
-    unique_pairs = set(e["address"] for e in events if "address" in e)
-
-    for pair_address in unique_pairs:
-        existing = get_pair_metadata(pair_address, db_pool)
-        if existing is None:
-            try:
-                metadata = fetch_and_store_uniswap_pair_metadata(pair_address, db_pool)
-                if metadata:
-                    logging.debug(
-                        f"[{worker_id}] Stored metadata for {metadata['token0_symbol']}/{metadata['token1_symbol']}"
-                    )
-            except Exception as e:
-                logging.warning(
-                    f"[{worker_id}] Failed to fetch metadata for {pair_address}: {e}"
-                )
-
-
-def process_block_range(
-    start_block, end_block, addresses, worker_id="main", collect_metadata=False
-):
-    if (start_block, end_block) in get_completed_ranges(db_pool):
+def process_block_range(start_block, end_block, addresses, worker_id="main"):
+    if (start_block, end_block) in get_completed_ranges():
         logging.debug(
             f"[{worker_id}] Skipping already processed range [{start_block:,}, {end_block:,}]"
         )
         return 0
 
-    mark_range_processing(start_block, end_block, db_pool, worker_id)
+    mark_range_processing(start_block, end_block, worker_id)
 
     try:
         events = fetch_logs_for_range(start_block, end_block, addresses, worker_id)
-
-        batch_insert_events(events, db_pool, worker_id)
-
-        if collect_metadata and events:
-            try:
-                collect_block_metadata_for_range(start_block, end_block, worker_id)
-                collect_pair_metadata_from_events(events, worker_id)
-            except Exception as e:
-                logging.warning(
-                    f"[{worker_id}] Metadata collection failed (non-fatal): {e}"
-                )
-
-        mark_range_completed(start_block, end_block, db_pool, worker_id)
-
+        batch_insert_events(events, worker_id)
+        mark_range_completed(start_block, end_block, worker_id)
         logging.debug(
             f"[{worker_id}] ✓ Processed [{start_block:,}, {end_block:,}] - {len(events)} events"
         )
         return len(events)
 
     except (Web3RPCError, HTTPError) as e:
-        # Check if we need to split (too many results OR response too large)
+        if isinstance(e, Web3RPCError):
+            error_msg = (
+                e.args[0].get("message", str(e))
+                if e.args and isinstance(e.args[0], dict)
+                else str(e)
+            )
+        else:
+            error_msg = str(e)
+
         if (
-            "more than 10000 results" in str(e)
-            or "-32005" in str(e)
-            or "Response payload too large" in str(e)
+            "more than 10000 results" in error_msg
+            or "-32005" in error_msg
+            or "Response payload too large" in error_msg
             or (hasattr(e, "response") and e.response.status_code == 413)
         ):
 
             mid = (start_block + end_block) // 2
-
             if mid == start_block:
                 logging.error(
                     f"[{worker_id}] Cannot split range [{start_block:,}, {end_block:,}] further - skipping"
                 )
-                mark_range_completed(start_block, end_block, db_pool, worker_id)
+                mark_range_completed(start_block, end_block, worker_id)
                 return 0
 
             logging.info(
-                f"[{worker_id}] Splitting [{start_block:,}, {end_block:,}] at {mid:,} (reason: {type(e).__name__})"
+                f"[{worker_id}] Splitting [{start_block:,}, {end_block:,}] at {mid:,} (reason: {error_msg})"
             )
-
-            count1 = process_block_range(
-                start_block, mid, addresses, worker_id, collect_metadata
-            )
-
-            count2 = process_block_range(
-                mid + 1, end_block, addresses, worker_id, collect_metadata
-            )
-
+            count1 = process_block_range(start_block, mid, addresses, worker_id)
+            count2 = process_block_range(mid + 1, end_block, addresses, worker_id)
             return count1 + count2
         else:
             logging.error(
-                f"[{worker_id}] Failed to process [{start_block:,}, {end_block:,}]: {e}"
+                f"[{worker_id}] Failed to process [{start_block:,}, {end_block:,}]: {error_msg}"
             )
             return 0
 
     except Exception as e:
-        logging.error(f"[{worker_id}] Unexpected error: {e}")
-        logging.error(traceback.format_exc())
+        logging.error(
+            f"[{worker_id}] Unexpected error [{start_block:,}, {end_block:,}]: {e}"
+        )
         return 0
 
 
 def generate_block_ranges(start_block, end_block, chunk_size):
-    completed = get_completed_ranges(db_pool)
+    completed = get_completed_ranges()
 
     ranges = []
     current = start_block
@@ -1655,8 +1650,13 @@ def scan_blockchain(
     end_block,
     chunk_size=10000,
     max_workers=3,
-    collect_metadata=False,
 ):
+
+    all_addresses = generate_v3_pool_list()
+    if token_filter:
+        filter_checksummed = [Web3.to_checksum_address(addr) for addr in token_filter]
+        addresses = [addr for addr in all_addresses if addr in filter_checksummed]
+        logging.info(f"Filtered: {len(addresses)}/{len(all_addresses)} addresses")
     ranges = generate_block_ranges(start_block, end_block, chunk_size)
 
     if not ranges:
@@ -1678,7 +1678,6 @@ def scan_blockchain(
                 end,
                 addresses,
                 f"worker-{i % max_workers}",
-                collect_metadata,
             ): (start, end, i)
             for i, (start, end) in enumerate(ranges)
         }
@@ -1718,40 +1717,8 @@ def scan_blockchain(
     logging.info(f"{'='*60}\n")
 
 
-def post_process_normalization():
-    logging.info("Starting post-processing normalization...")
-
-    pairs = get_all_unique_pairs_from_db(db_pool)
-    logging.info(f"Found {len(pairs)} unique pairs")
-
-    for idx, pair_address in enumerate(pairs):
-        logging.info(f"[{idx+1}/{len(pairs)}] Processing {pair_address}")
-
-        metadata = get_pair_metadata(pair_address, db_pool)
-        if metadata is None:
-            logging.info(f"  Fetching metadata...")
-            metadata = fetch_and_store_uniswap_pair_metadata(pair_address, db_pool)
-
-        if metadata and metadata["token0_decimals"] is not None:
-            logging.info(
-                f"  Normalizing values for {metadata.get('token0_symbol', '?')}/{metadata.get('token1_symbol', '?')}..."
-            )
-            normalize_values_for_pair(pair_address, db_pool)
-        else:
-            logging.warning(f"  Cannot normalize - missing decimals")
-
-    logging.info("✓ Post-processing complete")
-
-
-print("✓ Enhanced scanning functions loaded")
-
-
-# In[12]:
-
-
 def scan_blockchain_to_duckdb(
     event_file=V3_EVENT_BY_CONTRACTS,
-    db_pool=None,
     start_block=10000001,
     end_block=20000000,
     chunk_size=10000,
@@ -1775,9 +1742,7 @@ def scan_blockchain_to_duckdb(
         addresses = all_addresses
         logging.info(f"Total addresses: {len(addresses)}")
 
-    setup_database(db_pool)
-
-    stats = get_database_stats(db_pool)
+    stats = get_database_stats()
     logging.info(
         f"Blocks: {start_block:,} → {end_block:,} | Chunk: {chunk_size:,} | Workers: {max_workers}"
     )
@@ -1787,11 +1752,9 @@ def scan_blockchain_to_duckdb(
     logging.info("=" * 60)
 
     try:
-        scan_blockchain(
-            addresses, start_block, end_block, chunk_size, max_workers, False
-        )
+        scan_blockchain(addresses, start_block, end_block, chunk_size, max_workers)
 
-        final_stats = get_database_stats(db_pool)
+        final_stats = get_database_stats()
         logging.info("=" * 60)
         logging.info("SCAN COMPLETE")
         logging.info(
@@ -1808,9 +1771,58 @@ def scan_blockchain_to_duckdb(
         logging.error(f"Fatal error: {e}", exc_info=True)
 
 
+def collect_metadata_for_scanned_events(max_workers=8):
+    conn = DB_POOL.get_connection()
+
+    # Get unique blocks from events (blocks that actually matter)
+    unique_blocks = conn.execute(
+        """
+        SELECT DISTINCT block_number 
+        FROM (
+            SELECT DISTINCT block_number FROM transfer
+            UNION
+            SELECT DISTINCT block_number FROM swap
+            UNION
+            SELECT DISTINCT block_number FROM mint
+            UNION
+            SELECT DISTINCT block_number FROM burn
+            UNION
+            SELECT DISTINCT block_number FROM collect
+            UNION
+            SELECT DISTINCT block_number FROM flash
+        )
+        ORDER BY block_number
+    """
+    ).fetchall()
+
+    unique_blocks = [b[0] for b in unique_blocks]
+
+    # Filter out blocks we already have metadata for
+    existing_blocks = conn.execute(
+        """
+        SELECT block_number FROM block_metadata
+    """
+    ).fetchall()
+    existing_blocks = {b[0] for b in existing_blocks}
+
+    missing_blocks = [b for b in unique_blocks if b not in existing_blocks]
+
+    if not missing_blocks:
+        logging.info("✓ All event blocks already have metadata")
+        return
+
+    logging.info(f"Fetching metadata for {len(missing_blocks):,} blocks with events...")
+
+    # Use existing efficient batch function
+    fetch_and_store_block_metadata(
+        missing_blocks, provider=None, max_workers=max_workers
+    )
+
+    logging.info("✓ Block metadata collection complete")
+
+
 def scan_all_pairs_in_batches(
     event_file=V3_EVENT_BY_CONTRACTS,
-    db_pool=None,
     start_block=10000001,
     end_block=20000000,
     chunk_size=10000,
@@ -1843,7 +1855,6 @@ def scan_all_pairs_in_batches(
         try:
             scan_blockchain_to_duckdb(
                 event_file=event_file,
-                db_pool=db_pool,
                 start_block=start_block,
                 end_block=end_block,
                 chunk_size=chunk_size,
@@ -1857,7 +1868,7 @@ def scan_all_pairs_in_batches(
             logging.error(f"Batch {batch_num} failed: {e}")
             continue
 
-    final_stats = get_database_stats(db_pool)
+    final_stats = get_database_stats()
     logging.info("=" * 60)
     logging.info("ALL BATCHES COMPLETE")
     logging.info(
@@ -1869,16 +1880,16 @@ def scan_all_pairs_in_batches(
     logging.info("=" * 60)
 
     logging.info("Collecting metadata...")
-    collect_missing_pair_metadata(db_pool)
+    collect_missing_pair_metadata()
 
     logging.info("Normalizing values...")
-    normalize_missing_pairs(db_pool)
+    normalize_missing_pairs()
 
     logging.info("✓ Complete")
 
 
-def query_database(db_pool):
-    conn = duckdb.connect(db_pool, read_only=True)
+def query_database():
+    conn = DB_POOL.get_connection()
 
     try:
         print("\n" + "=" * 60)
@@ -1937,9 +1948,9 @@ def query_database(db_pool):
         conn.close()
 
 
-def get_pair_info(pair_address, db_pool):
+def get_pair_info(pair_address):
     pair_address = Web3.to_checksum_address(pair_address)
-    conn = duckdb.connect(db_pool, read_only=True)
+    conn = DB_POOL.get_connection()
 
     try:
         print("\n" + "=" * 60)
@@ -2011,23 +2022,16 @@ print("✓ Main functions loaded")
 # In[ ]:
 
 
+# Find the token_filter around line 1040, change to just a few pools:
 token_filter = [
-    "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
-    "0x3139Ffc91B99aa94DA8A2dc13f1fC36F9BDc98eE",
-    "0x12EDE161c702D1494612d19f05992f43aa6A26FB",
-    "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11",
-    "0x07F068ca326a469Fc1d87d85d448990C8cBa7dF9",
-    "0xAE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5",
-    "0xCe407CD7b95B39d3B4d53065E711e713dd5C5999",
-    "0x33C2d48Bc95FB7D0199C5C693e7a9F527145a9Af",
+    "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",  # USDC/WETH
+    "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11",  # DAI/WETH
 ]
 
-START_BLOCK = 12369621
-END_BLOCK = w3.eth.block_number
-START_BLOCK = 10000000
-END_BLOCK = 10500000
-CHUNK_SIZE = 5000
-MAX_WORKERS = 4
+START_BLOCK = 12369621  # V3 Factory deployment
+END_BLOCK = 12370000  # Start with just 130k blocks to test
+CHUNK_SIZE = 100
+MAX_WORKERS = 2
 
 try:
     logging.info("=" * 80)
@@ -2035,47 +2039,40 @@ try:
     logging.info("=" * 80)
     logging.info(f"Blocks: {START_BLOCK:,} → {END_BLOCK:,} (current)")
     logging.info(f"Config: chunk={CHUNK_SIZE:,} | workers={MAX_WORKERS}")
-    db_pool = setup_database(DB_PATH)
-    stats = get_database_stats(db_pool)
+    stats = get_database_stats()
     logging.info(
         f"DB: {stats['total_transfers']:,} transfers | {stats['total_swaps']:,} swaps | {stats['completed_ranges']} ranges done"
     )
     logging.info("=" * 80)
 
-    if input("Start? (y/n): ").strip().lower() != "y":
-        logging.info("Cancelled")
-    else:
-        scan_blockchain_to_duckdb(
-            event_file=V3_EVENT_BY_CONTRACTS,
-            db_pool=db_pool,
-            start_block=START_BLOCK,
-            end_block=END_BLOCK,
-            chunk_size=CHUNK_SIZE,
-            max_workers=MAX_WORKERS,
-        )
+    scan_blockchain_to_duckdb(
+        event_file=V3_EVENT_BY_CONTRACTS,
+        start_block=START_BLOCK,
+        end_block=END_BLOCK,
+        chunk_size=CHUNK_SIZE,
+        max_workers=MAX_WORKERS,
+        token_filter=token_filter,
+    )
 
-        logging.info("\nPost-processing...")
-        collect_missing_pair_metadata(db_pool, batch_size=50, max_workers=4)
-        normalize_missing_pairs(db_pool, max_workers=4)
+    logging.info("\nPost-processing...")
+    collect_metadata_for_scanned_events(max_workers=8)
+    collect_missing_pair_metadata(batch_size=50, max_workers=4)
+    normalize_missing_pairs(max_workers=4)
 
-        final = get_database_stats(db_pool)
-        logging.info("=" * 80)
-        logging.info("COMPLETE")
-        logging.info(
-            f"Transfers: {final['total_transfers']:,} | Swaps: {final['total_swaps']:,}"
-        )
-        logging.info(
-            f"Mints: {final['total_mints']:,} | Burns: {final['total_burns']:,}"
-        )
-        logging.info(
-            f"Pairs: {final['total_pairs']:,} | Blocks: {final['total_blocks']:,}"
-        )
-        logging.info("=" * 80)
+    final = get_database_stats()
+    logging.info("=" * 80)
+    logging.info("COMPLETE")
+    logging.info(
+        f"Transfers: {final['total_transfers']:,} | Swaps: {final['total_swaps']:,}"
+    )
+    logging.info(f"Mints: {final['total_mints']:,} | Burns: {final['total_burns']:,}")
+    logging.info(f"Pairs: {final['total_pairs']:,} | Blocks: {final['total_blocks']:,}")
+    logging.info("=" * 80)
 
 except KeyboardInterrupt:
     logging.warning("\n" + "=" * 80)
     logging.warning("INTERRUPTED - Progress saved")
-    stats = get_database_stats(db_pool)
+    stats = get_database_stats()
     logging.warning(
         f"State: {stats['total_transfers']:,} transfers | {stats['completed_ranges']} ranges"
     )
@@ -2090,7 +2087,6 @@ except Exception as e:
     raise
 
 finally:
-    if hasattr(_thread_local, "conn") and _thread_local.conn:
-        _thread_local.conn.close()
-
+    if DB_POOL:
+        DB_POOL.close_all()
 print("✓ Main ready")
