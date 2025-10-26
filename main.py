@@ -814,49 +814,49 @@ def normalize_values_for_pair(pair_address):
     conn.execute(
         """
         UPDATE transfer
-        SET value_normalized = value::DECIMAL / POWER(10, ?)
+        SET value_normalized = CAST(value AS DOUBLE) / POWER(10, ?)
         WHERE pair_address = ? AND value_normalized IS NULL
-        """,
+    """,
         (lp_decimals, pair_address),
     )
 
     conn.execute(
         """
         UPDATE mint
-        SET amount0_normalized = amount0::DECIMAL / POWER(10, ?),
-            amount1_normalized = amount1::DECIMAL / POWER(10, ?)
+        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
+            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
         WHERE pair_address = ? AND amount0_normalized IS NULL
-        """,
+    """,
         (token0_decimals, token1_decimals, pair_address),
     )
 
     conn.execute(
         """
         UPDATE burn
-        SET amount0_normalized = amount0::DECIMAL / POWER(10, ?),
-            amount1_normalized = amount1::DECIMAL / POWER(10, ?)
+        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
+            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
         WHERE pair_address = ? AND amount0_normalized IS NULL
-        """,
+    """,
         (token0_decimals, token1_decimals, pair_address),
     )
 
     conn.execute(
         """
         UPDATE swap
-        SET amount0_normalized = amount0::DECIMAL / POWER(10, ?),
-            amount1_normalized = amount1::DECIMAL / POWER(10, ?)
+        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
+            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
         WHERE pair_address = ? AND amount0_normalized IS NULL
-        """,
+    """,
         (token0_decimals, token1_decimals, pair_address),
     )
 
     conn.execute(
         """
         UPDATE collect
-        SET amount0_normalized = amount0::DECIMAL / POWER(10, ?),
-            amount1_normalized = amount1::DECIMAL / POWER(10, ?)
+        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
+            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
         WHERE pair_address = ? AND amount0_normalized IS NULL
-        """,
+    """,
         (token0_decimals, token1_decimals, pair_address),
     )
 
@@ -1048,57 +1048,96 @@ def fetch_block_metadata(block_number, provider=None, retry_count=0, max_retries
         return None
 
 
+def parallel_fetch_with_backoff(items, fetch_func, max_workers=4, desc="Processing"):
+    results = [None] * len(items)
+    results_lock = threading.Lock()
+
+    def worker(idx, item):
+        provider, provider_name = PROVIDER_POOL.get_provider()
+        try:
+            result = fetch_func(item, provider)
+            with results_lock:
+                results[idx] = result
+            return result
+        except Exception as e:
+            logging.warning(f"{desc} failed for item {idx}: {e}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(worker, i, item): i for i, item in enumerate(items)}
+
+        completed = 0
+        total = len(items)
+
+        for future in as_completed(futures):
+            completed += 1
+            if completed % 10 == 0 or completed == total:
+                logging.info(
+                    f"{desc}: {completed}/{total} ({100*completed/total:.1f}%)"
+                )
+
+    return [r for r in results if r is not None]
+
+
 def generate_v3_pool_list(
-    output_file=V3_POOL_LIST_FILE, start_block=FACTORY_DEPLOYMENT_BLOCK
+    output_file=V3_POOL_LIST_FILE, start_block=FACTORY_DEPLOYMENT_BLOCK, max_workers=4
 ):
-    """
-    Fetch all V3 pool addresses from PoolCreated events and save to a simple text file
-    """
     if os.path.exists(output_file):
         logging.info(f"✓ Pool list already exists: {output_file}")
         with open(output_file, "r") as f:
-            pools = [line.strip() for line in f if line.strip()]
-        logging.info(f"Loaded {len(pools)} V3 pools from file")
-        return pools
+            pools_dict = json.load(f)
+        logging.info(f"Loaded {len(pools_dict)} V3 pools from file")
+        return list(pools_dict.keys())
 
     logging.info("Generating V3 pool list from PoolCreated events...")
-    provider, _ = PROVIDER_POOL.get_provider()
 
-    # Use existing ABI fetching system
     factory_abi = get_abi(UNISWAP_V3_FACTORY)
-    factory_contract = provider.eth.contract(
-        address=UNISWAP_V3_FACTORY, abi=factory_abi
-    )
-
+    provider, _ = PROVIDER_POOL.get_provider()
     current_block = provider.eth.block_number
     chunk_size = 10000
-    pools = set()
 
-    for from_block in range(start_block, current_block + 1, chunk_size):
-        to_block = min(from_block + chunk_size - 1, current_block)
-        try:
-            logs = factory_contract.events.PoolCreated.get_logs(
-                from_block=from_block, to_block=to_block
-            )
-            for log in logs:
-                pools.add(log.args.pool)
-            if logs:
-                logging.info(
-                    f"[{from_block:,} - {to_block:,}] Found {len(logs)} pools | Total: {len(pools):,}"
-                )
-        except Exception as e:
-            logging.warning(f"Error fetching pools at block {from_block:,}: {e}")
-            time.sleep(1)
-            continue
+    ranges = [
+        (fb, min(fb + chunk_size - 1, current_block))
+        for fb in range(start_block, current_block + 1, chunk_size)
+    ]
 
-    pools = sorted(pools)
+    def fetch_pool_range(range_tuple, provider):
+        from_block, to_block = range_tuple
+        factory_contract = provider.eth.contract(
+            address=UNISWAP_V3_FACTORY, abi=factory_abi
+        )
+        logs = factory_contract.events.PoolCreated.get_logs(
+            from_block=from_block, to_block=to_block
+        )
+
+        pools = {}
+        for log in logs:
+            pools[log.args.pool] = {
+                "token0": log.args.token0,
+                "token1": log.args.token1,
+                "fee": log.args.fee,
+                "tickSpacing": log.args.tickSpacing,
+                "created_block": log.blockNumber,
+            }
+
+        if pools:
+            logging.info(f"[{from_block:,} - {to_block:,}] Found {len(pools)} pools")
+        return pools
+
+    all_pools_list = parallel_fetch_with_backoff(
+        ranges, fetch_pool_range, max_workers, "Fetching pools"
+    )
+
+    pools_dict = {}
+    for pool_batch in all_pools_list:
+        pools_dict.update(pool_batch)
+
     os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
     with open(output_file, "w") as f:
-        for pool in pools:
-            f.write(f"{pool}\n")
+        json.dump(pools_dict, f, indent=2)
 
-    logging.info(f"✓ Saved {len(pools)} V3 pools to {output_file}")
-    return pools
+    logging.info(f"✓ Saved {len(pools_dict)} V3 pools to {output_file}")
+    return list(pools_dict.keys())
 
 
 def fetch_and_store_uniswap_pair_metadata(
@@ -1167,33 +1206,34 @@ def fetch_and_store_uniswap_pair_metadata(
     return None
 
 
-def fetch_and_store_block_metadata(block_numbers, provider=None, max_workers=8):
-    provider_name = "provided"
-    if provider is None:
-        provider, provider_name = PROVIDER_POOL.get_provider()
+def fetch_and_store_block_metadata(block_numbers, max_workers=4):
+    if not block_numbers:
+        return 0
 
-    blocks_data = []
+    def fetch_single_block(block_num, provider):
+        try:
+            block = provider.eth.get_block(block_num)
+            return (block_num, block["timestamp"], block["hash"].hex())
+        except Exception as e:
+            logging.warning(f"Failed to fetch block {block_num}: {e}")
+            return None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_block = {
-            executor.submit(fetch_block_metadata, block_num, provider): block_num
-            for block_num in block_numbers
-        }
+    blocks_data = parallel_fetch_with_backoff(
+        list(block_numbers),
+        fetch_single_block,
+        max_workers=max_workers,
+        desc="Fetching block metadata",
+    )
 
-        for future in as_completed(future_to_block):
-            block_num = future_to_block[future]
-            try:
-                block_data = future.result()
-                if block_data:
-                    blocks_data.append(block_data)
-            except Exception as e:
-                logging.error(f"Failed to fetch block {block_num}: {e}")
+    blocks_data = [b for b in blocks_data if b is not None]
 
     if blocks_data:
-        batch_insert_block_metadata(blocks_data)
-        logging.info(
-            f"✓ Stored metadata for {len(blocks_data)} blocks using {provider_name}"
+        conn = DB_POOL.get_connection()
+        conn.executemany(
+            "INSERT INTO block_metadata (block_number, block_timestamp, block_hash) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            blocks_data,
         )
+        logging.info(f"✓ Stored metadata for {len(blocks_data)} blocks")
 
     return len(blocks_data)
 
@@ -1718,8 +1758,7 @@ def scan_blockchain(
 
 
 def scan_blockchain_to_duckdb(
-    event_file=V3_EVENT_BY_CONTRACTS,
-    start_block=10000001,
+    start_block=FACTORY_DEPLOYMENT_BLOCK,
     end_block=20000000,
     chunk_size=10000,
     max_workers=3,
@@ -1729,10 +1768,8 @@ def scan_blockchain_to_duckdb(
     logging.info("BLOCKCHAIN SCANNER")
     logging.info("=" * 60)
 
-    with open(event_file, "r") as f:
-        all_pairs = json.load(f)
-
-    all_addresses = [Web3.to_checksum_address(addr) for addr in all_pairs.keys()]
+    # Generate/load V3 pool list instead of reading JSON
+    all_addresses = generate_v3_pool_list()
 
     if token_filter:
         filter_checksummed = [Web3.to_checksum_address(addr) for addr in token_filter]
@@ -1740,8 +1777,8 @@ def scan_blockchain_to_duckdb(
         logging.info(f"Filtered: {len(addresses)}/{len(all_addresses)} addresses")
     else:
         addresses = all_addresses
-        logging.info(f"Total addresses: {len(addresses)}")
 
+    logging.info(f"Total addresses: {len(addresses)}")
     stats = get_database_stats()
     logging.info(
         f"Blocks: {start_block:,} → {end_block:,} | Chunk: {chunk_size:,} | Workers: {max_workers}"
@@ -1753,7 +1790,6 @@ def scan_blockchain_to_duckdb(
 
     try:
         scan_blockchain(addresses, start_block, end_block, chunk_size, max_workers)
-
         final_stats = get_database_stats()
         logging.info("=" * 60)
         logging.info("SCAN COMPLETE")
@@ -1764,45 +1800,30 @@ def scan_blockchain_to_duckdb(
             f"Mints: {final_stats['total_mints']:,} | Burns: {final_stats['total_burns']:,}"
         )
         logging.info("=" * 60)
-
     except KeyboardInterrupt:
         logging.warning("\nInterrupted - progress saved to database")
     except Exception as e:
         logging.error(f"Fatal error: {e}", exc_info=True)
 
 
-def collect_metadata_for_scanned_events(max_workers=8):
+def collect_metadata_for_scanned_events(max_workers=4):
     conn = DB_POOL.get_connection()
 
-    # Get unique blocks from events (blocks that actually matter)
     unique_blocks = conn.execute(
         """
-        SELECT DISTINCT block_number 
-        FROM (
-            SELECT DISTINCT block_number FROM transfer
-            UNION
-            SELECT DISTINCT block_number FROM swap
-            UNION
-            SELECT DISTINCT block_number FROM mint
-            UNION
-            SELECT DISTINCT block_number FROM burn
-            UNION
-            SELECT DISTINCT block_number FROM collect
-            UNION
+        SELECT DISTINCT block_number FROM (
+            SELECT DISTINCT block_number FROM transfer UNION
+            SELECT DISTINCT block_number FROM swap UNION
+            SELECT DISTINCT block_number FROM mint UNION
+            SELECT DISTINCT block_number FROM burn UNION
+            SELECT DISTINCT block_number FROM collect UNION
             SELECT DISTINCT block_number FROM flash
-        )
-        ORDER BY block_number
+        ) ORDER BY block_number
     """
     ).fetchall()
-
     unique_blocks = [b[0] for b in unique_blocks]
 
-    # Filter out blocks we already have metadata for
-    existing_blocks = conn.execute(
-        """
-        SELECT block_number FROM block_metadata
-    """
-    ).fetchall()
+    existing_blocks = conn.execute("SELECT block_number FROM block_metadata").fetchall()
     existing_blocks = {b[0] for b in existing_blocks}
 
     missing_blocks = [b for b in unique_blocks if b not in existing_blocks]
@@ -1812,12 +1833,7 @@ def collect_metadata_for_scanned_events(max_workers=8):
         return
 
     logging.info(f"Fetching metadata for {len(missing_blocks):,} blocks with events...")
-
-    # Use existing efficient batch function
-    fetch_and_store_block_metadata(
-        missing_blocks, provider=None, max_workers=max_workers
-    )
-
+    fetch_and_store_block_metadata(missing_blocks, max_workers=max_workers)
     logging.info("✓ Block metadata collection complete")
 
 
@@ -2046,7 +2062,6 @@ try:
     logging.info("=" * 80)
 
     scan_blockchain_to_duckdb(
-        event_file=V3_EVENT_BY_CONTRACTS,
         start_block=START_BLOCK,
         end_block=END_BLOCK,
         chunk_size=CHUNK_SIZE,
