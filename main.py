@@ -10,11 +10,13 @@ import tempfile
 import threading
 import duckdb
 import requests
+import random
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from datetime import datetime
 from plotly.subplots import make_subplots
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -29,11 +31,18 @@ from web3.providers.rpc.utils import (
 # Configuration
 load_dotenv()
 pd.options.display.float_format = "{:20,.4f}".format
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_filename = os.path.join(
+    # log_dir, f"uniswap_v3_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_dir,
+    f"lol.txt",
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.StreamHandler(), logging.FileHandler(log_filename)],
 )
 
 ETHERSCAN_API_KEY_DICT = {
@@ -66,8 +75,6 @@ class ProviderPool:
     def __init__(self, api_key_dict):
         self.providers = []
         self.provider_names = []
-        self.index = 0
-        self.lock = threading.Lock()
 
         for name, config in api_key_dict.items():
             provider = Web3(
@@ -82,6 +89,7 @@ class ProviderPool:
                     ),
                 )
             )
+
             if provider.is_connected():
                 self.providers.append(provider)
                 self.provider_names.append(name)
@@ -93,11 +101,8 @@ class ProviderPool:
             raise Exception("No providers connected!")
 
     def get_provider(self):
-        with self.lock:
-            provider = self.providers[self.index]
-            name = self.provider_names[self.index]
-            self.index = (self.index + 1) % len(self.providers)
-            return provider, name
+        idx = random.randint(0, len(self.providers) - 1)
+        return self.providers[idx], self.provider_names[idx]
 
 
 class ABICache:
@@ -139,15 +144,43 @@ class DuckDBConnectionPool:
         self.db_path = db_path
         self.connections = {}
         self.lock = threading.Lock()
+        self.connection_timeout = 300
+        self.last_used = {}
 
     def get_connection(self):
         thread_id = threading.get_ident()
+
         with self.lock:
-            if thread_id not in self.connections:
-                conn = duckdb.connect(self.db_path)
-                self.connections[thread_id] = conn
-                logging.debug(f"Created DB connection for thread {thread_id}")
-        return self.connections[thread_id]
+            now = time.time()
+
+            if thread_id in self.connections:
+                self.last_used[thread_id] = now
+                return self.connections[thread_id]
+
+            self._cleanup_stale_connections(now)
+
+            conn = duckdb.connect(self.db_path)
+            self.connections[thread_id] = conn
+            self.last_used[thread_id] = now
+            logging.debug(f"Created DB connection for thread {thread_id}")
+            return conn
+
+    def _cleanup_stale_connections(self, now):
+        stale_threads = [
+            tid
+            for tid, last_time in self.last_used.items()
+            if now - last_time > self.connection_timeout
+        ]
+
+        for tid in stale_threads:
+            if tid in self.connections:
+                try:
+                    self.connections[tid].close()
+                    del self.connections[tid]
+                    del self.last_used[tid]
+                    logging.debug(f"Closed stale connection for thread {tid}")
+                except Exception as e:
+                    logging.warning(f"Error closing stale connection: {e}")
 
     def close_all(self):
         with self.lock:
@@ -160,19 +193,7 @@ class DuckDBConnectionPool:
                         f"Error closing connection for thread {thread_id}: {e}"
                     )
             self.connections.clear()
-
-    def close_current_thread(self):
-        thread_id = threading.get_ident()
-        with self.lock:
-            if thread_id in self.connections:
-                try:
-                    self.connections[thread_id].close()
-                    del self.connections[thread_id]
-                    logging.debug(f"Closed DB connection for thread {thread_id}")
-                except Exception as e:
-                    logging.warning(
-                        f"Error closing connection for thread {thread_id}: {e}"
-                    )
+            self.last_used.clear()
 
 
 class TokenCache:
@@ -180,6 +201,9 @@ class TokenCache:
         self.cache_file = cache_file
         self.cache = {}
         self.lock = threading.Lock()
+        self.dirty = False
+        self.last_save = time.time()
+        self.save_interval = 60
 
         if os.path.exists(cache_file):
             try:
@@ -200,9 +224,16 @@ class TokenCache:
                 "symbol": symbol,
                 "address": token_address,
             }
-            self._save_to_disk()
+            self.dirty = True
+
+            now = time.time()
+            if now - self.last_save >= self.save_interval:
+                self._save_to_disk()
 
     def _save_to_disk(self):
+        if not self.dirty:
+            return
+
         try:
             dirn = os.path.dirname(self.cache_file) or "."
             os.makedirs(dirn, exist_ok=True)
@@ -210,10 +241,33 @@ class TokenCache:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.cache, f, indent=2, ensure_ascii=False)
             os.replace(tmp, self.cache_file)
+            self.dirty = False
+            self.last_save = time.time()
         except Exception as e:
             logging.warning(f"Failed to save token cache: {e}")
 
+    def flush(self):
+        with self.lock:
+            self._save_to_disk()
 
+
+class RateLimiter:
+    def __init__(self, max_calls_per_second):
+        self.min_interval = 1.0 / max_calls_per_second
+        self.last_call = 0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_call
+            if time_since_last < self.min_interval:
+                sleep_time = self.min_interval - time_since_last
+                time.sleep(sleep_time)
+            self.last_call = time.time()
+
+
+ETHERSCAN_RATE_LIMITER = RateLimiter(5)
 TOKEN_CACHE = TokenCache()
 ABI_CACHE = ABICache()
 PROVIDER_POOL = ProviderPool(ETHERSCAN_API_KEY_DICT)
@@ -256,7 +310,7 @@ def get_abi(contract_address, api_key=ETHERSCAN_API_KEY, abi_folder=ABI_CACHE_FO
                 f"Corrupted ABI cache for {contract_address}: {e}, re-fetching..."
             )
 
-    time.sleep(0.25)
+    ETHERSCAN_RATE_LIMITER.wait()
 
     try:
         url = f"https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address={contract_address}&apikey={api_key}"
@@ -352,6 +406,157 @@ MINIMAL_UNISWAP_V3_POOL_ABI = [
         "type": "function",
     },
 ]
+
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+MULTICALL3_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "target", "type": "address"},
+                    {"name": "callData", "type": "bytes"},
+                ],
+                "name": "calls",
+                "type": "tuple[]",
+            }
+        ],
+        "name": "aggregate",
+        "outputs": [
+            {"name": "blockNumber", "type": "uint256"},
+            {"name": "returnData", "type": "bytes[]"},
+        ],
+        "stateMutability": "payable",
+        "type": "function",
+    }
+]
+EVENT_SIGNATURE_CACHE = {}
+ABI_HASH_CACHE = {}
+EVENT_CACHE_LOCK = threading.Lock()
+
+
+def get_abi_hash(abi):
+    return hash(json.dumps(abi, sort_keys=True))
+
+
+def decode_logs_for_contract(contract_address, logs, provider):
+    abi, contract = ABI_CACHE.get_contract(contract_address, provider)
+
+    if not abi or not contract:
+        return [create_transaction_dict(log, provider, {}) for log in logs]
+
+    event_map = get_event_signature_map(contract_address, abi)
+    transactions = []
+
+    for log in logs:
+        if log.get("topics") and len(log["topics"]) > 0:
+            event_signature_hash = log["topics"][0].hex()
+
+            if event_signature_hash in event_map:
+                event_name = event_map[event_signature_hash]
+
+                try:
+                    decoded = contract.events[event_name]().process_log(log)
+                    topics = {
+                        "event": event_name,
+                        "args": dict(decoded["args"]),
+                    }
+                except Exception:
+                    topics = {}
+            else:
+                topics = {}
+        else:
+            topics = {}
+
+        transactions.append(create_transaction_dict(log, provider, topics))
+
+    return transactions
+
+
+def get_event_signature_map(contract_address, abi):
+    with EVENT_CACHE_LOCK:
+        if contract_address in EVENT_SIGNATURE_CACHE:
+            return EVENT_SIGNATURE_CACHE[contract_address]
+
+        abi_hash = get_abi_hash(abi)
+
+        if abi_hash in ABI_HASH_CACHE:
+            event_map = ABI_HASH_CACHE[abi_hash]
+            EVENT_SIGNATURE_CACHE[contract_address] = event_map
+            return event_map
+
+        event_map = build_event_signature_map(abi)
+        EVENT_SIGNATURE_CACHE[contract_address] = event_map
+        ABI_HASH_CACHE[abi_hash] = event_map
+        return event_map
+
+
+def fetch_metadata_multicall(pair_addresses, provider=None):
+    if provider is None:
+        provider, _ = PROVIDER_POOL.get_provider()
+
+    multicall = provider.eth.contract(address=MULTICALL3_ADDRESS, abi=MULTICALL3_ABI)
+
+    calls = []
+    call_map = []
+
+    for pair_address in pair_addresses:
+        pair_address = provider.to_checksum_address(pair_address)
+
+        pool_contract = provider.eth.contract(
+            address=pair_address, abi=MINIMAL_UNISWAP_V3_POOL_ABI
+        )
+
+        calls.append(
+            (
+                pair_address,
+                pool_contract.functions.token0().build_transaction(
+                    {"to": pair_address}
+                )["data"],
+            )
+        )
+        call_map.append(("token0", pair_address))
+
+        calls.append(
+            (
+                pair_address,
+                pool_contract.functions.token1().build_transaction(
+                    {"to": pair_address}
+                )["data"],
+            )
+        )
+        call_map.append(("token1", pair_address))
+
+        calls.append(
+            (
+                pair_address,
+                pool_contract.functions.fee().build_transaction({"to": pair_address})[
+                    "data"
+                ],
+            )
+        )
+        call_map.append(("fee", pair_address))
+
+    block_num, results = multicall.functions.aggregate(calls).call()
+
+    metadata_dict = {}
+    for idx, (call_type, pair_addr) in enumerate(call_map):
+        if pair_addr not in metadata_dict:
+            metadata_dict[pair_addr] = {}
+
+        if call_type == "token0":
+            metadata_dict[pair_addr]["token0_address"] = provider.to_checksum_address(
+                "0x" + results[idx].hex()[-40:]
+            )
+        elif call_type == "token1":
+            metadata_dict[pair_addr]["token1_address"] = provider.to_checksum_address(
+                "0x" + results[idx].hex()[-40:]
+            )
+        elif call_type == "fee":
+            metadata_dict[pair_addr]["fee_tier"] = int.from_bytes(
+                results[idx], byteorder="big"
+            )
+
+    return metadata_dict
 
 
 def get_contract_with_fallback(
@@ -532,82 +737,58 @@ def batch_insert_events(events, worker_id="main"):
                     e["address"],
                     args.get("owner", ""),
                     args.get("spender", ""),
-                    int(args.get("value", 0)),
+                    str(args.get("value", 0)),
                 )
             )
 
     conn = DB_POOL.get_connection()
 
     try:
+        conn.execute("BEGIN TRANSACTION")
+
         if transfers:
             conn.executemany(
-                """
-                INSERT INTO transfer (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO transfer (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 transfers,
             )
 
         if swaps:
             conn.executemany(
-                """
-                INSERT INTO swap (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO swap (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 swaps,
             )
 
         if mints:
             conn.executemany(
-                """
-                INSERT INTO mint (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, sender, amount, amount0, amount1)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO mint (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, sender, amount, amount0, amount1) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 mints,
             )
 
         if burns:
             conn.executemany(
-                """
-                INSERT INTO burn (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, amount, amount0, amount1)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO burn (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, amount, amount0, amount1) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 burns,
             )
 
         if collects:
             conn.executemany(
-                """
-                INSERT INTO collect (transaction_hash, log_index, block_number, pair_address, owner, recipient, tick_lower, tick_upper, amount0, amount1)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO collect (transaction_hash, log_index, block_number, pair_address, owner, recipient, tick_lower, tick_upper, amount0, amount1) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 collects,
             )
 
         if flashes:
             conn.executemany(
-                """
-                INSERT INTO flash (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, paid0, paid1)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO flash (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, paid0, paid1) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 flashes,
             )
 
         if approvals:
             conn.executemany(
-                """
-                INSERT INTO approval (transaction_hash, log_index, block_number, pair_address, owner, spender, value)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING
-            """,
+                "INSERT INTO approval (transaction_hash, log_index, block_number, pair_address, owner, spender, value) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_hash, log_index) DO NOTHING",
                 approvals,
             )
+
+        conn.execute("COMMIT")
 
         total = (
             len(transfers)
@@ -628,6 +809,7 @@ def batch_insert_events(events, worker_id="main"):
         return total
 
     except Exception as e:
+        conn.execute("ROLLBACK")
         logging.error(f"[{worker_id}] batch_insert_events failed: {e}")
         raise
 
@@ -811,56 +993,40 @@ def normalize_values_for_pair(pair_address):
 
     conn = DB_POOL.get_connection()
 
-    conn.execute(
-        """
-        UPDATE transfer
-        SET value_normalized = CAST(value AS DOUBLE) / POWER(10, ?)
-        WHERE pair_address = ? AND value_normalized IS NULL
-    """,
-        (lp_decimals, pair_address),
-    )
+    conn.execute("BEGIN TRANSACTION")
 
-    conn.execute(
-        """
-        UPDATE mint
-        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
-            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
-        WHERE pair_address = ? AND amount0_normalized IS NULL
-    """,
-        (token0_decimals, token1_decimals, pair_address),
-    )
+    try:
+        conn.execute(
+            "UPDATE transfer SET value_normalized = CAST(value AS DOUBLE) / POWER(10, ?) WHERE pair_address = ? AND value_normalized IS NULL",
+            (lp_decimals, pair_address),
+        )
 
-    conn.execute(
-        """
-        UPDATE burn
-        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
-            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
-        WHERE pair_address = ? AND amount0_normalized IS NULL
-    """,
-        (token0_decimals, token1_decimals, pair_address),
-    )
+        conn.execute(
+            "UPDATE mint SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?), amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?) WHERE pair_address = ? AND amount0_normalized IS NULL",
+            (token0_decimals, token1_decimals, pair_address),
+        )
 
-    conn.execute(
-        """
-        UPDATE swap
-        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
-            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
-        WHERE pair_address = ? AND amount0_normalized IS NULL
-    """,
-        (token0_decimals, token1_decimals, pair_address),
-    )
+        conn.execute(
+            "UPDATE burn SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?), amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?) WHERE pair_address = ? AND amount0_normalized IS NULL",
+            (token0_decimals, token1_decimals, pair_address),
+        )
 
-    conn.execute(
-        """
-        UPDATE collect
-        SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?),
-            amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?)
-        WHERE pair_address = ? AND amount0_normalized IS NULL
-    """,
-        (token0_decimals, token1_decimals, pair_address),
-    )
+        conn.execute(
+            "UPDATE swap SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?), amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?) WHERE pair_address = ? AND amount0_normalized IS NULL",
+            (token0_decimals, token1_decimals, pair_address),
+        )
 
-    logging.debug(f"✓ Normalized values for pair {pair_address}")
+        conn.execute(
+            "UPDATE collect SET amount0_normalized = CAST(amount0 AS DOUBLE) / POWER(10, ?), amount1_normalized = CAST(amount1 AS DOUBLE) / POWER(10, ?) WHERE pair_address = ? AND amount0_normalized IS NULL",
+            (token0_decimals, token1_decimals, pair_address),
+        )
+
+        conn.execute("COMMIT")
+
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        logging.error(f"Failed to normalize {pair_address}: {e}")
+        raise
 
 
 def validate_uniswap_v3_pool(
@@ -927,62 +1093,122 @@ def fetch_uniswap_pair_metadata(pair_address, provider=None):
 
     pair_address = provider.to_checksum_address(pair_address)
 
-    try:
-        pair_contract = get_contract_with_fallback(
-            pair_address, provider, contract_type="uniswap_v3_pool"
-        )
+    pair_contract = get_contract_with_fallback(
+        pair_address, provider, contract_type="uniswap_v3_pool"
+    )
 
-        token0_address = pair_contract.functions.token0().call()
-        token1_address = pair_contract.functions.token1().call()
-
-        token0_contract = get_contract_with_fallback(
-            token0_address, provider, contract_type="erc20"
-        )
-        token1_contract = get_contract_with_fallback(
-            token1_address, provider, contract_type="erc20"
-        )
-
-        metadata = {
-            "pair_address": pair_address,
-            "token0_address": token0_address,
-            "token1_address": token1_address,
-        }
-
+    def safe_call(func, default=None):
         try:
-            metadata["fee_tier"] = pair_contract.functions.fee().call()
-        except:
-            metadata["fee_tier"] = None
+            return func()
+        except Exception:
+            return default
 
-        try:
-            metadata["tick_spacing"] = pair_contract.functions.tickSpacing().call()
-        except:
-            metadata["tick_spacing"] = None
+    token0_address = safe_call(lambda: pair_contract.functions.token0().call())
+    token1_address = safe_call(lambda: pair_contract.functions.token1().call())
 
-        try:
-            metadata["token0_symbol"] = token0_contract.functions.symbol().call()
-        except:
-            metadata["token0_symbol"] = None
-
-        try:
-            metadata["token0_decimals"] = token0_contract.functions.decimals().call()
-        except:
-            metadata["token0_decimals"] = None
-
-        try:
-            metadata["token1_symbol"] = token1_contract.functions.symbol().call()
-        except:
-            metadata["token1_symbol"] = None
-
-        try:
-            metadata["token1_decimals"] = token1_contract.functions.decimals().call()
-        except:
-            metadata["token1_decimals"] = None
-
-        return metadata
-
-    except Exception as e:
-        logging.debug(f"Failed to fetch metadata for {pair_address[:10]}: {e}")
+    if not token0_address or not token1_address:
         return None
+
+    token0_contract = get_contract_with_fallback(
+        token0_address, provider, contract_type="erc20"
+    )
+    token1_contract = get_contract_with_fallback(
+        token1_address, provider, contract_type="erc20"
+    )
+
+    metadata = {
+        "pair_address": pair_address,
+        "token0_address": token0_address,
+        "token1_address": token1_address,
+        "fee_tier": safe_call(lambda: pair_contract.functions.fee().call()),
+        "tick_spacing": safe_call(lambda: pair_contract.functions.tickSpacing().call()),
+        "token0_symbol": safe_call(lambda: token0_contract.functions.symbol().call()),
+        "token0_decimals": safe_call(
+            lambda: token0_contract.functions.decimals().call()
+        ),
+        "token1_symbol": safe_call(lambda: token1_contract.functions.symbol().call()),
+        "token1_decimals": safe_call(
+            lambda: token1_contract.functions.decimals().call()
+        ),
+    }
+
+    return metadata
+
+
+def fetch_block_metadata_batch(block_numbers, provider=None, batch_size=100):
+    if provider is None:
+        provider, _ = PROVIDER_POOL.get_provider()
+
+    blocks_data = []
+
+    for i in range(0, len(block_numbers), batch_size):
+        batch = block_numbers[i : i + batch_size]
+
+        try:
+            batch_results = []
+            for block_num in batch:
+                try:
+                    block = provider.eth.get_block(block_num)
+                    batch_results.append(
+                        (
+                            block_num,
+                            datetime.fromtimestamp(block["timestamp"]),
+                            block["hash"].hex(),
+                        )
+                    )
+                except Exception as e:
+                    logging.warning(f"Failed to fetch block {block_num}: {e}")
+
+            blocks_data.extend(batch_results)
+
+            if len(blocks_data) % 1000 == 0:
+                logging.info(f"Fetched {len(blocks_data)}/{len(block_numbers)} blocks")
+
+        except Exception as e:
+            logging.error(f"Batch failed: {e}")
+
+    return blocks_data
+
+
+def get_blocks_in_range_efficiently(start_block, end_block, provider=None):
+    if provider is None:
+        provider, _ = PROVIDER_POOL.get_provider()
+
+    conn = DB_POOL.get_connection()
+
+    existing = conn.execute(
+        "SELECT block_number FROM block_metadata WHERE block_number BETWEEN ? AND ?",
+        (start_block, end_block),
+    ).fetchall()
+    existing_set = {b[0] for b in existing}
+
+    missing = [b for b in range(start_block, end_block + 1) if b not in existing_set]
+
+    if not missing:
+        return []
+
+    blocks_data = []
+
+    for block_num in missing:
+        try:
+            block = provider.eth.get_block(block_num)
+            blocks_data.append(
+                (
+                    block_num,
+                    datetime.fromtimestamp(block["timestamp"]),
+                    block["hash"].hex(),
+                )
+            )
+        except Exception as e:
+            logging.warning(f"Failed block {block_num}: {e}")
+
+    if blocks_data:
+        conn.executemany(
+            "INSERT INTO block_metadata (block_number, block_timestamp, block_hash) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            blocks_data,
+        )
+
+    return blocks_data
 
 
 def fetch_block_metadata(block_number, provider=None, retry_count=0, max_retries=3):
@@ -991,7 +1217,11 @@ def fetch_block_metadata(block_number, provider=None, retry_count=0, max_retries
 
     try:
         block = provider.eth.get_block(block_number)
-        return (block_number, block["timestamp"], block["hash"].hex())
+        return (
+            block_number,
+            datetime.fromtimestamp(block["timestamp"]),
+            block["hash"].hex(),
+        )
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:
@@ -1079,23 +1309,530 @@ def parallel_fetch_with_backoff(items, fetch_func, max_workers=4, desc="Processi
     return [r for r in results if r is not None]
 
 
+def estimate_chunk_size(start_block, end_block, addresses):
+    conn = DB_POOL.get_connection()
+
+    sample_size = min(100, end_block - start_block)
+    sample_start = start_block
+    sample_end = start_block + sample_size
+
+    provider, _ = PROVIDER_POOL.get_provider()
+
+    try:
+        logs = provider.eth.get_logs(
+            {
+                "fromBlock": sample_start,
+                "toBlock": sample_end,
+                "address": addresses[:100],
+            }
+        )
+
+        events_per_block = len(logs) / sample_size if sample_size > 0 else 0
+
+        if events_per_block > 100:
+            return 1000
+        elif events_per_block > 10:
+            return 5000
+        else:
+            return 10000
+
+    except:
+        return 10000
+
+
+def compute_pool_hourly_stats(pool_address, start_block, end_block):
+    conn = DB_POOL.get_connection()
+
+    metadata = get_pair_metadata(pool_address)
+    if not metadata:
+        return
+
+    fee_tier = metadata.get("fee_tier", 3000)
+    fee_percentage = fee_tier / 1000000
+
+    conn.execute(
+        """
+        INSERT INTO pool_hourly_stats (
+            pool_address,
+            hour_timestamp,
+            swap_count,
+            volume_token0,
+            volume_token1,
+            fees_token0,
+            fees_token1,
+            liquidity_avg,
+            price_avg
+        )
+        SELECT 
+            s.pair_address,
+            DATE_TRUNC('hour', b.block_timestamp) as hour,
+            COUNT(*) as swap_count,
+            SUM(ABS(s.amount0_normalized)) as volume_token0,
+            SUM(ABS(s.amount1_normalized)) as volume_token1,
+            SUM(ABS(s.amount0_normalized)) * ? as fees_token0,
+            SUM(ABS(s.amount1_normalized)) * ? as fees_token1,
+            AVG(s.liquidity) as liquidity_avg,
+            AVG(POWER(s.sqrt_price_x96 / POWER(2.0, 96), 2)) as price_avg
+        FROM swap s
+        JOIN block_metadata b ON s.block_number = b.block_number
+        WHERE s.pair_address = ?
+            AND s.block_number BETWEEN ? AND ?
+        GROUP BY s.pair_address, hour
+        ON CONFLICT (pool_address, hour_timestamp) DO UPDATE SET
+            swap_count = EXCLUDED.swap_count,
+            volume_token0 = EXCLUDED.volume_token0,
+            volume_token1 = EXCLUDED.volume_token1,
+            fees_token0 = EXCLUDED.fees_token0,
+            fees_token1 = EXCLUDED.fees_token1,
+            liquidity_avg = EXCLUDED.liquidity_avg,
+            price_avg = EXCLUDED.price_avg
+    """,
+        (fee_percentage, fee_percentage, pool_address, start_block, end_block),
+    )
+
+    logging.info(f"✓ Computed hourly stats for {pool_address[:10]}")
+
+
+def update_pool_current_state(pool_address):
+    conn = DB_POOL.get_connection()
+
+    latest_swap = conn.execute(
+        """
+        SELECT sqrt_price_x96, tick, liquidity, block_number
+        FROM swap
+        WHERE pair_address = ?
+        ORDER BY block_number DESC, log_index DESC
+        LIMIT 1
+    """,
+        (pool_address,),
+    ).fetchone()
+
+    if not latest_swap:
+        return
+
+    total_stats = conn.execute(
+        """
+        SELECT 
+            COUNT(*) as total_swaps,
+            SUM(ABS(amount0_normalized)) as total_volume0,
+            SUM(ABS(amount1_normalized)) as total_volume1
+        FROM swap
+        WHERE pair_address = ?
+    """,
+        (pool_address,),
+    ).fetchone()
+
+    conn.execute(
+        """
+        INSERT INTO pool_current_state (
+            pool_address,
+            current_sqrt_price_x96,
+            current_tick,
+            current_liquidity,
+            last_swap_block,
+            total_swaps,
+            total_volume_token0,
+            total_volume_token1,
+            updated_at
+        ) VALUES (?, CAST(? AS HUGEINT), CAST(? AS HUGEINT), ?, ?, ?, ?, ?, NOW())
+        ON CONFLICT (pool_address) DO UPDATE SET
+            current_sqrt_price_x96 = EXCLUDED.current_sqrt_price_x96,
+            current_tick = EXCLUDED.current_tick,
+            current_liquidity = EXCLUDED.current_liquidity,
+            last_swap_block = EXCLUDED.last_swap_block,
+            total_swaps = EXCLUDED.total_swaps,
+            total_volume_token0 = EXCLUDED.total_volume_token0,
+            total_volume_token1 = EXCLUDED.total_volume_token1,
+            updated_at = NOW()
+    """,
+        (
+            pool_address,
+            latest_swap[0],
+            latest_swap[1],
+            latest_swap[2],
+            latest_swap[3],
+            total_stats[0],
+            total_stats[1],
+            total_stats[2],
+        ),
+    )
+
+
+def build_position_state(pool_address):
+    conn = DB_POOL.get_connection()
+
+    positions = {}
+
+    mints = conn.execute(
+        """
+        SELECT owner, tick_lower, tick_upper, amount0_normalized, amount1_normalized, block_number
+        FROM mint
+        WHERE pair_address = ?
+        ORDER BY block_number ASC, log_index ASC
+    """,
+        (pool_address,),
+    ).fetchall()
+
+    burns = conn.execute(
+        """
+        SELECT owner, tick_lower, tick_upper, amount0_normalized, amount1_normalized, block_number
+        FROM burn
+        WHERE pair_address = ?
+        ORDER BY block_number ASC, log_index ASC
+    """,
+        (pool_address,),
+    ).fetchall()
+
+    for owner, tick_lower, tick_upper, amount0, amount1, block_number in mints:
+        key = (owner, tick_lower, tick_upper)
+        if key not in positions:
+            positions[key] = {"amount0": 0, "amount1": 0, "last_block": block_number}
+        positions[key]["amount0"] += amount0 or 0
+        positions[key]["amount1"] += amount1 or 0
+        positions[key]["last_block"] = block_number
+
+    for owner, tick_lower, tick_upper, amount0, amount1, block_number in burns:
+        key = (owner, tick_lower, tick_upper)
+        if key not in positions:
+            positions[key] = {"amount0": 0, "amount1": 0, "last_block": block_number}
+        positions[key]["amount0"] -= amount0 or 0
+        positions[key]["amount1"] -= amount1 or 0
+        positions[key]["last_block"] = block_number
+
+    active_positions = []
+    for (owner, tick_lower, tick_upper), data in positions.items():
+        if abs(data["amount0"]) > 1e-10 or abs(data["amount1"]) > 1e-10:
+            active_positions.append(
+                {
+                    "owner": owner,
+                    "tick_lower": tick_lower,
+                    "tick_upper": tick_upper,
+                    "amount0": data["amount0"],
+                    "amount1": data["amount1"],
+                    "last_block": data["last_block"],
+                }
+            )
+
+    return active_positions
+
+
+def get_liquidity_distribution(pool_address, tick_spacing=60):
+    conn = DB_POOL.get_connection()
+
+    positions = build_position_state(pool_address)
+
+    tick_liquidity = {}
+
+    for pos in positions:
+        tick_lower = pos["tick_lower"]
+        tick_upper = pos["tick_upper"]
+        amount0 = pos["amount0"]
+        amount1 = pos["amount1"]
+
+        for tick in range(tick_lower, tick_upper + 1, tick_spacing):
+            if tick not in tick_liquidity:
+                tick_liquidity[tick] = {"token0": 0, "token1": 0}
+            tick_liquidity[tick]["token0"] += amount0
+            tick_liquidity[tick]["token1"] += amount1
+
+    distribution = []
+    for tick, liquidity in sorted(tick_liquidity.items()):
+        distribution.append(
+            {
+                "tick": tick,
+                "token0_liquidity": liquidity["token0"],
+                "token1_liquidity": liquidity["token1"],
+            }
+        )
+
+    return distribution
+
+
+def denormalize_timestamps():
+    conn = DB_POOL.get_connection()
+
+    logging.info("Denormalizing timestamps...")
+
+    conn.execute(
+        """
+        UPDATE swap s
+        SET block_timestamp = b.block_timestamp
+        FROM block_metadata b
+        WHERE s.block_number = b.block_number
+        AND s.block_timestamp IS NULL
+    """
+    )
+
+    conn.execute(
+        """
+        UPDATE mint m
+        SET block_timestamp = b.block_timestamp
+        FROM block_metadata b
+        WHERE m.block_number = b.block_number
+        AND m.block_timestamp IS NULL
+    """
+    )
+
+    conn.execute(
+        """
+        UPDATE burn bn
+        SET block_timestamp = b.block_timestamp
+        FROM block_metadata b
+        WHERE bn.block_number = b.block_number
+        AND bn.block_timestamp IS NULL
+    """
+    )
+
+    logging.info("✓ Timestamps denormalized")
+
+
+def denormalize_pair_symbols():
+    conn = DB_POOL.get_connection()
+
+    logging.info("Denormalizing pair symbols...")
+
+    conn.execute(
+        """
+        UPDATE swap s
+        SET token0_symbol = pm.token0_symbol,
+            token1_symbol = pm.token1_symbol
+        FROM pair_metadata pm
+        WHERE s.pair_address = pm.pair_address
+        AND s.token0_symbol IS NULL
+    """
+    )
+
+    logging.info("✓ Pair symbols denormalized")
+
+
+def refresh_pool_summary():
+    conn = DB_POOL.get_connection()
+
+    logging.info("Refreshing pool summary...")
+
+    conn.execute("DROP TABLE IF EXISTS pool_summary")
+
+    conn.execute(
+        """
+        CREATE TABLE pool_summary AS
+        SELECT 
+            pm.pair_address,
+            pm.token0_symbol,
+            pm.token1_symbol,
+            pm.token0_decimals,
+            pm.token1_decimals,
+            pm.fee_tier,
+            COUNT(DISTINCT s.transaction_hash) as total_swaps,
+            COUNT(DISTINCT m.transaction_hash) as total_mints,
+            COUNT(DISTINCT b.transaction_hash) as total_burns,
+            SUM(ABS(s.amount0_normalized)) as total_volume_token0,
+            SUM(ABS(s.amount1_normalized)) as total_volume_token1,
+            MIN(s.block_number) as first_swap_block,
+            MAX(s.block_number) as last_swap_block
+        FROM pair_metadata pm
+        LEFT JOIN swap s ON pm.pair_address = s.pair_address
+        LEFT JOIN mint m ON pm.pair_address = m.pair_address
+        LEFT JOIN burn b ON pm.pair_address = b.pair_address
+        GROUP BY pm.pair_address, pm.token0_symbol, pm.token1_symbol, 
+                 pm.token0_decimals, pm.token1_decimals, pm.fee_tier
+    """
+    )
+
+    conn.execute(
+        "CREATE INDEX idx_pool_summary_volume ON pool_summary(total_volume_token0)"
+    )
+    conn.execute("CREATE INDEX idx_pool_summary_swaps ON pool_summary(total_swaps)")
+
+    logging.info("✓ Pool summary refreshed")
+
+
+def aggregate_all_pools(max_workers=8):
+    conn = DB_POOL.get_connection()
+
+    pools = conn.execute("SELECT DISTINCT pair_address FROM swap").fetchall()
+    pools = [p[0] for p in pools]
+
+    logging.info(f"Aggregating stats for {len(pools)} pools...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for pool in pools:
+            futures.append(executor.submit(update_pool_current_state, pool))
+
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Failed to aggregate pool: {e}")
+
+
+def sqrt_price_x96_to_price(sqrt_price_x96, token0_decimals, token1_decimals):
+    price = (sqrt_price_x96 / (2**96)) ** 2
+    decimal_adjustment = (10**token0_decimals) / (10**token1_decimals)
+    return price * decimal_adjustment
+
+
+def tick_to_price(tick, token0_decimals, token1_decimals):
+    price = 1.0001**tick
+    decimal_adjustment = (10**token0_decimals) / (10**token1_decimals)
+    return price * decimal_adjustment
+
+
+def get_pool_price_history(pool_address, start_block=None, end_block=None, limit=1000):
+    conn = DB_POOL.get_connection()
+
+    metadata = get_pair_metadata(pool_address)
+    if (
+        not metadata
+        or not metadata["token0_decimals"]
+        or not metadata["token1_decimals"]
+    ):
+        logging.error(f"Cannot compute price: missing decimals for {pool_address}")
+        return None
+
+    token0_decimals = metadata["token0_decimals"]
+    token1_decimals = metadata["token1_decimals"]
+
+    query = """
+        SELECT 
+            s.block_number,
+            b.block_timestamp,
+            s.sqrt_price_x96,
+            s.tick,
+            s.liquidity
+        FROM swap s
+        JOIN block_metadata b ON s.block_number = b.block_number
+        WHERE s.pair_address = ?
+    """
+
+    params = [pool_address]
+
+    if start_block:
+        query += " AND s.block_number >= ?"
+        params.append(start_block)
+
+    if end_block:
+        query += " AND s.block_number <= ?"
+        params.append(end_block)
+
+    query += " ORDER BY s.block_number DESC, s.log_index DESC LIMIT ?"
+    params.append(limit)
+
+    results = conn.execute(query, params).fetchall()
+
+    price_history = []
+    for row in results:
+        block_number, timestamp, sqrt_price_x96, tick, liquidity = row
+
+        if sqrt_price_x96:
+            price = sqrt_price_x96_to_price(
+                sqrt_price_x96, token0_decimals, token1_decimals
+            )
+            price_history.append(
+                {
+                    "block_number": block_number,
+                    "timestamp": timestamp,
+                    "price": price,
+                    "tick": tick,
+                    "liquidity": liquidity,
+                }
+            )
+
+    return price_history
+
+
+def calculate_tvl_for_pool(pool_address, block_number=None):
+    conn = DB_POOL.get_connection()
+
+    metadata = get_pair_metadata(pool_address)
+    if not metadata:
+        return None
+
+    if block_number:
+        query = """
+            SELECT 
+                SUM(CASE WHEN amount0_normalized > 0 THEN amount0_normalized ELSE 0 END) -
+                SUM(CASE WHEN amount0_normalized < 0 THEN ABS(amount0_normalized) ELSE 0 END) as net_token0,
+                SUM(CASE WHEN amount1_normalized > 0 THEN amount1_normalized ELSE 0 END) -
+                SUM(CASE WHEN amount1_normalized < 0 THEN ABS(amount1_normalized) ELSE 0 END) as net_token1
+            FROM (
+                SELECT amount0_normalized, amount1_normalized FROM mint WHERE pair_address = ? AND block_number <= ?
+                UNION ALL
+                SELECT -amount0_normalized, -amount1_normalized FROM burn WHERE pair_address = ? AND block_number <= ?
+            )
+        """
+        result = conn.execute(
+            query, (pool_address, block_number, pool_address, block_number)
+        ).fetchone()
+    else:
+        query = """
+            SELECT 
+                SUM(CASE WHEN amount0_normalized > 0 THEN amount0_normalized ELSE 0 END) -
+                SUM(CASE WHEN amount0_normalized < 0 THEN ABS(amount0_normalized) ELSE 0 END) as net_token0,
+                SUM(CASE WHEN amount1_normalized > 0 THEN amount1_normalized ELSE 0 END) -
+                SUM(CASE WHEN amount1_normalized < 0 THEN ABS(amount1_normalized) ELSE 0 END) as net_token1
+            FROM (
+                SELECT amount0_normalized, amount1_normalized FROM mint WHERE pair_address = ?
+                UNION ALL
+                SELECT -amount0_normalized, -amount1_normalized FROM burn WHERE pair_address = ?
+            )
+        """
+        result = conn.execute(query, (pool_address, pool_address)).fetchone()
+
+    return {
+        "token0_tvl": result[0] or 0,
+        "token1_tvl": result[1] or 0,
+        "token0_symbol": metadata.get("token0_symbol"),
+        "token1_symbol": metadata.get("token1_symbol"),
+    }
+
+
+def generate_block_ranges_adaptive(start_block, end_block, addresses):
+    completed = get_completed_ranges()
+    ranges = []
+    current = start_block
+
+    while current <= end_block:
+        chunk_size = estimate_chunk_size(current, end_block, addresses)
+        end = min(current + chunk_size - 1, end_block)
+
+        if (current, end) not in completed:
+            ranges.append((current, end))
+
+        current = end + 1
+
+    return ranges
+
+
 def generate_v3_pool_list(
     output_file=V3_POOL_LIST_FILE, start_block=FACTORY_DEPLOYMENT_BLOCK, max_workers=4
 ):
     if os.path.exists(output_file):
-        logging.info(f"✓ Pool list already exists: {output_file}")
         with open(output_file, "r") as f:
             pools_dict = json.load(f)
-        logging.info(f"Loaded {len(pools_dict)} V3 pools from file")
-        return list(pools_dict.keys())
+        max_block = max(
+            [p.get("created_block", 0) for p in pools_dict.values()] or [start_block]
+        )
+        logging.info(
+            f"Loaded {len(pools_dict)} existing pools, last block: {max_block:,}"
+        )
+        provider, _ = PROVIDER_POOL.get_provider()
+        current_block = provider.eth.block_number
+        if max_block >= current_block - 10:
+            logging.info(f"Pool list is up to date")
+            return list(pools_dict.keys())
+        logging.info(
+            f"Updating pool list from block {max_block + 1:,} to {current_block:,}"
+        )
+        start_block = max_block + 1
+    else:
+        pools_dict = {}
+        provider, _ = PROVIDER_POOL.get_provider()
+        current_block = provider.eth.block_number
 
     logging.info("Generating V3 pool list from PoolCreated events...")
-
     factory_abi = get_abi(UNISWAP_V3_FACTORY)
-    provider, _ = PROVIDER_POOL.get_provider()
-    current_block = provider.eth.block_number
     chunk_size = 10000
-
     ranges = [
         (fb, min(fb + chunk_size - 1, current_block))
         for fb in range(start_block, current_block + 1, chunk_size)
@@ -1103,32 +1840,47 @@ def generate_v3_pool_list(
 
     def fetch_pool_range(range_tuple, provider):
         from_block, to_block = range_tuple
-        factory_contract = provider.eth.contract(
-            address=UNISWAP_V3_FACTORY, abi=factory_abi
-        )
-        logs = factory_contract.events.PoolCreated.get_logs(
-            from_block=from_block, to_block=to_block
-        )
-
-        pools = {}
-        for log in logs:
-            pools[log.args.pool] = {
-                "token0": log.args.token0,
-                "token1": log.args.token1,
-                "fee": log.args.fee,
-                "tickSpacing": log.args.tickSpacing,
-                "created_block": log.blockNumber,
-            }
-
-        if pools:
-            logging.info(f"[{from_block:,} - {to_block:,}] Found {len(pools)} pools")
-        return pools
+        for retry in range(5):
+            try:
+                factory_contract = provider.eth.contract(
+                    address=UNISWAP_V3_FACTORY, abi=factory_abi
+                )
+                logs = factory_contract.events.PoolCreated.get_logs(
+                    from_block=from_block, to_block=to_block
+                )
+                pools = {}
+                for log in logs:
+                    pools[log.args.pool] = {
+                        "token0": log.args.token0,
+                        "token1": log.args.token1,
+                        "fee": log.args.fee,
+                        "tickSpacing": log.args.tickSpacing,
+                        "created_block": log.blockNumber,
+                    }
+                if pools:
+                    logging.info(
+                        f"[{from_block:,} - {to_block:,}] Found {len(pools)} pools"
+                    )
+                return pools
+            except Exception as e:
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    wait = 3 * (retry + 1)
+                    logging.warning(
+                        f"Rate limit [{from_block:,}-{to_block:,}], retry in {wait}s"
+                    )
+                    time.sleep(wait)
+                    provider, _ = PROVIDER_POOL.get_provider()
+                    continue
+                else:
+                    logging.error(f"Error [{from_block:,}-{to_block:,}]: {e}")
+                    return {}
+        logging.error(f"Failed [{from_block:,}-{to_block:,}] after 5 retries")
+        return {}
 
     all_pools_list = parallel_fetch_with_backoff(
         ranges, fetch_pool_range, max_workers, "Fetching pools"
     )
 
-    pools_dict = {}
     for pool_batch in all_pools_list:
         pools_dict.update(pool_batch)
 
@@ -1206,6 +1958,51 @@ def fetch_and_store_uniswap_pair_metadata(
     return None
 
 
+def parallel_fetch_with_backoff(
+    items, fetch_func, max_workers=4, desc="Processing", max_retries=3
+):
+    results = [None] * len(items)
+    results_lock = threading.Lock()
+
+    def worker(idx, item, retry_count=0):
+        provider, provider_name = PROVIDER_POOL.get_provider()
+        try:
+            result = fetch_func(item, provider)
+            with results_lock:
+                results[idx] = result
+            return result
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                if retry_count < max_retries:
+                    wait_time = (2**retry_count) + random.uniform(0, 1)
+                    logging.warning(
+                        f"{desc} failed for item {idx} (429 rate limit), retrying in {wait_time:.1f}s... (attempt {retry_count + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    return worker(idx, item, retry_count + 1)
+                else:
+                    logging.error(
+                        f"{desc} failed for item {idx} after {max_retries} retries: {e}"
+                    )
+                    return None
+            else:
+                logging.warning(f"{desc} failed for item {idx}: {e}")
+                return None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(worker, i, item): i for i, item in enumerate(items)}
+        completed = 0
+        total = len(items)
+        for future in as_completed(futures):
+            completed += 1
+            if completed % 10 == 0 or completed == total:
+                logging.info(
+                    f"{desc}: {completed}/{total} ({100*completed/total:.1f}%)"
+                )
+
+    return [r for r in results if r is not None]
+
+
 def fetch_and_store_block_metadata(block_numbers, max_workers=4):
     if not block_numbers:
         return 0
@@ -1213,7 +2010,11 @@ def fetch_and_store_block_metadata(block_numbers, max_workers=4):
     def fetch_single_block(block_num, provider):
         try:
             block = provider.eth.get_block(block_num)
-            return (block_num, block["timestamp"], block["hash"].hex())
+            return (
+                block_num,
+                datetime.fromtimestamp(block["timestamp"]),
+                block["hash"].hex(),
+            )
         except Exception as e:
             logging.warning(f"Failed to fetch block {block_num}: {e}")
             return None
@@ -1594,7 +2395,13 @@ def collect_block_metadata_for_range(start_block, end_block, worker_id="main"):
     for block_num in missing_blocks:
         try:
             block = provider.eth.get_block(block_num)
-            blocks_data.append((block_num, block["timestamp"], block["hash"].hex()))
+            blocks_data.append(
+                (
+                    block_num,
+                    datetime.fromtimestamp(block["timestamp"]),
+                    block["hash"].hex(),
+                )
+            )
         except Exception as e:
             logging.warning(f"[{worker_id}] Failed to fetch block {block_num}: {e}")
 
@@ -2105,3 +2912,195 @@ finally:
     if DB_POOL:
         DB_POOL.close_all()
 print("✓ Main ready")
+# =============================================================================
+# MISSING HELPER FUNCTIONS - ADD THESE
+# =============================================================================
+
+
+def print_database_summary():
+    stats = get_database_stats()
+
+    print("\n" + "=" * 60)
+    print("DATABASE SUMMARY")
+    print("=" * 60)
+    print(f"Events:")
+    print(f"  Transfers:  {stats['total_transfers']:>12,}")
+    print(f"  Swaps:      {stats['total_swaps']:>12,}")
+    print(f"  Mints:      {stats['total_mints']:>12,}")
+    print(f"  Burns:      {stats['total_burns']:>12,}")
+    print(f"  Collects:   {stats['total_collects']:>12,}")
+    print(f"  Flashes:    {stats['total_flashes']:>12,}")
+    print(f"  Approvals:  {stats['total_approvals']:>12,}")
+    total_events = (
+        stats["total_transfers"]
+        + stats["total_swaps"]
+        + stats["total_mints"]
+        + stats["total_burns"]
+        + stats["total_collects"]
+        + stats["total_flashes"]
+        + stats["total_approvals"]
+    )
+    print(f"  TOTAL:      {total_events:>12,}")
+    print(f"\nMetadata:")
+    print(f"  Pairs:      {stats['total_pairs']:>12,}")
+    print(f"  Blocks:     {stats['total_blocks']:>12,}")
+    print(f"  Ranges:     {stats['completed_ranges']:>12,}")
+    print("=" * 60 + "\n")
+
+
+def collect_metadata_for_scanned_events(max_workers=8):
+    conn = DB_POOL.get_connection()
+
+    unique_blocks = conn.execute(
+        """
+        SELECT DISTINCT block_number FROM (
+            SELECT DISTINCT block_number FROM transfer
+            UNION SELECT DISTINCT block_number FROM swap
+            UNION SELECT DISTINCT block_number FROM mint
+            UNION SELECT DISTINCT block_number FROM burn
+            UNION SELECT DISTINCT block_number FROM collect
+            UNION SELECT DISTINCT block_number FROM flash
+        ) ORDER BY block_number
+    """
+    ).fetchall()
+    unique_blocks = [b[0] for b in unique_blocks]
+
+    existing_blocks = conn.execute("SELECT block_number FROM block_metadata").fetchall()
+    existing_blocks = {b[0] for b in existing_blocks}
+
+    missing_blocks = [b for b in unique_blocks if b not in existing_blocks]
+
+    if not missing_blocks:
+        logging.info("✓ All event blocks already have metadata")
+        return
+
+    logging.info(f"Fetching metadata for {len(missing_blocks):,} blocks with events...")
+    fetch_and_store_block_metadata(missing_blocks, max_workers=max_workers)
+    logging.info("✓ Block metadata collection complete")
+
+
+def run_full_pipeline(
+    start_block=FACTORY_DEPLOYMENT_BLOCK,
+    end_block=None,
+    chunk_size=10000,
+    max_workers=3,
+    token_filter=None,
+):
+    """
+    Complete Uniswap V3 data pipeline
+    """
+
+    try:
+        logging.info("=" * 80)
+        logging.info("UNISWAP V3 DATA PIPELINE")
+        logging.info("=" * 80)
+
+        provider, _ = PROVIDER_POOL.get_provider()
+        if end_block is None:
+            end_block = provider.eth.block_number
+            logging.info(f"Using current block as end: {end_block:,}")
+
+        logging.info(f"Block range: {start_block:,} → {end_block:,}")
+        logging.info(f"Configuration: chunk={chunk_size:,}, workers={max_workers}")
+
+        logging.info("\n" + "=" * 80)
+        logging.info("STAGE 1: BLOCKCHAIN SCANNING")
+        logging.info("=" * 80)
+
+        scan_blockchain_to_duckdb(
+            start_block=start_block,
+            end_block=end_block,
+            chunk_size=chunk_size,
+            max_workers=max_workers,
+            token_filter=token_filter,
+        )
+
+        print_database_summary()
+
+        logging.info("\n" + "=" * 80)
+        logging.info("STAGE 2: METADATA COLLECTION")
+        logging.info("=" * 80)
+
+        logging.info("\n📦 Collecting block metadata...")
+        collect_metadata_for_scanned_events(max_workers=8)
+
+        logging.info("\n📦 Collecting pair metadata...")
+        collect_missing_pair_metadata(batch_size=50, max_workers=4)
+
+        print_database_summary()
+
+        logging.info("\n" + "=" * 80)
+        logging.info("STAGE 3: VALUE NORMALIZATION")
+        logging.info("=" * 80)
+
+        normalize_missing_pairs(max_workers=8)
+
+        print_database_summary()
+
+        logging.info("\n" + "=" * 80)
+        logging.info("STAGE 4: AGGREGATION & OPTIMIZATION")
+        logging.info("=" * 80)
+
+        logging.info("\n📊 Denormalizing timestamps...")
+        denormalize_timestamps()
+
+        logging.info("\n📊 Denormalizing pair symbols...")
+        denormalize_pair_symbols()
+
+        logging.info("\n📊 Refreshing pool summary...")
+        refresh_pool_summary()
+
+        logging.info("\n📊 Updating pool current state...")
+        aggregate_all_pools(max_workers=8)
+
+        logging.info("\n" + "=" * 80)
+        logging.info("✅ PIPELINE COMPLETE")
+        logging.info("=" * 80)
+
+        print_database_summary()
+
+    except KeyboardInterrupt:
+        logging.warning("\n⚠️  INTERRUPTED - Progress saved")
+        print_database_summary()
+
+    except Exception as e:
+        logging.error(f"\n❌ ERROR: {e}")
+        logging.error(traceback.format_exc())
+        raise
+
+    finally:
+        if TOKEN_CACHE:
+            TOKEN_CACHE.flush()
+        if DB_POOL:
+            DB_POOL.close_all()
+
+
+# =============================================================================
+# MAIN EXECUTION - THIS IS WHAT RUNS WHEN YOU START THE SCRIPT
+# =============================================================================
+
+if __name__ == "__main__":
+
+    # CONFIGURATION - EDIT THESE VALUES
+    START_BLOCK = 12369621  # Uniswap V3 Factory deployment
+    END_BLOCK = 12370000  # Small range for testing (change to None for latest)
+    CHUNK_SIZE = 100  # Blocks per request
+    MAX_WORKERS = 2  # Parallel workers
+
+    # Optional: filter specific pools (None = scan all pools)
+    TOKEN_FILTER = None
+    # TOKEN_FILTER = [
+    #     "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8",  # USDC/WETH
+    #     "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",  # USDC/WETH (another one)
+    # ]
+
+    # RUN THE PIPELINE
+    run_full_pipeline(
+        start_block=START_BLOCK,
+        end_block=END_BLOCK,
+        chunk_size=CHUNK_SIZE,
+        max_workers=MAX_WORKERS,
+        token_filter=TOKEN_FILTER,
+    )
+
+    logging.info("\n✅ All done! You can now query the database.")
