@@ -1,0 +1,4 @@
+- Don't comment your code
+- Don't use Python Typing
+- Minimize the Hallucination or speculation, Alwasy use official docs and code you can prove it's origin from either Stack Overflow or the official documentation
+- If you miss information or precision, please ask for more clarification or clearly display every part you speculated/assumed without having the explicit information

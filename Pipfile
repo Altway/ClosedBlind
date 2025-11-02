@@ -17,8 +17,8 @@ numba = "*"
 duckdb = "*"
 tenacity = "*"
 duckdb-engine = "*"
-sqlalchemy = "*"
 python-dotenv = "*"
+requests-cache = "*"
 
 [dev-packages]
 ipykernel = "*"
