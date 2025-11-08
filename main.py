@@ -1360,12 +1360,24 @@ def get_event_signature_map(contract_address, abi):
 # =============================================================================
 
 
-def setup_database(db_path=DB_PATH, schema_path="./out/V3/database/schema.sql"):
+def setup_database(db_path=DB_PATH, schema_path="./out/V3/database/schema_optimized.sql"):
     conn = duckdb.connect(db_path)
-    with open(schema_path, "r") as f:
-        schema_sql = f.read()
-    conn.execute(schema_sql)
-    logging.info("✓ Database schema loaded successfully")
+
+    try:
+        result = conn.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'swap'").fetchone()
+        if result[0] > 0:
+            logging.info("✓ Database tables already exist, skipping schema creation")
+        else:
+            with open(schema_path, "r") as f:
+                schema_sql = f.read()
+            conn.execute(schema_sql)
+            logging.info("✓ Database schema created successfully")
+    except Exception as e:
+        with open(schema_path, "r") as f:
+            schema_sql = f.read()
+        conn.execute(schema_sql)
+        logging.info("✓ Database schema loaded successfully")
+
     conn.close()
     return DuckDBConnectionPool(db_path)
 
@@ -1477,24 +1489,36 @@ def is_block_metadata_cached(block_number):
 
 def is_block_range_analyzed_for_addresses(start_block, end_block, addresses):
     """
-    Check if this exact block range has been analyzed for these specific addresses
+    OPTIMIZED: Check if this exact block range has been analyzed for these specific addresses using bulk query
     Returns dict with addresses that have been analyzed
     """
     conn = DB_POOL.get_connection()
     try:
-        analyzed_addresses = {}
-        for address in addresses:
-            result = conn.execute(
-                """SELECT events_found, processed_at FROM block_range_address_tracking
-                WHERE pair_address = ? AND start_block = ? AND end_block = ? AND status = 'completed'""",
-                (address, start_block, end_block),
-            ).fetchone()
+        if not addresses:
+            return {}
 
-            if result:
-                analyzed_addresses[address] = {
-                    "events_found": result[0],
-                    "processed_at": result[1],
-                }
+        # Create temp table with addresses (FAST bulk operation)
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS temp_check_addresses (address VARCHAR)")
+        conn.execute("DELETE FROM temp_check_addresses")
+        conn.executemany("INSERT INTO temp_check_addresses VALUES (?)", [(addr,) for addr in addresses])
+
+        # Single bulk query instead of N queries
+        result = conn.execute(
+            """SELECT pair_address, events_found, processed_at
+            FROM block_range_address_tracking
+            WHERE start_block = ? AND end_block = ? AND status = 'completed'
+            AND pair_address IN (SELECT address FROM temp_check_addresses)""",
+            (start_block, end_block),
+        ).fetchall()
+
+        # Build result dict
+        analyzed_addresses = {
+            row[0]: {
+                "events_found": row[1],
+                "processed_at": row[2],
+            }
+            for row in result
+        }
 
         return analyzed_addresses
     finally:
@@ -1532,31 +1556,48 @@ def get_missing_block_ranges_for_addresses(
     start_block, end_block, chunk_size, addresses
 ):
     """
-    Find which block ranges are missing for which addresses
+    OPTIMIZED: Find which block ranges are missing for which addresses using bulk query
     Returns list of (start_block, end_block, [missing_addresses]) tuples
     """
     conn = DB_POOL.get_connection()
     try:
-        missing_ranges = []
-
         # Generate all expected ranges
+        ranges = []
         for range_start in range(start_block, end_block + 1, chunk_size):
             range_end = min(range_start + chunk_size - 1, end_block)
+            ranges.append((range_start, range_end))
 
-            # Check which addresses are missing for this range
-            missing_addresses = []
-            for address in addresses:
+        # Create temp table with all addresses (FAST bulk operation)
+        conn.execute("CREATE TEMP TABLE temp_addresses (address VARCHAR)")
+        conn.executemany("INSERT INTO temp_addresses VALUES (?)", [(addr,) for addr in addresses])
+
+        missing_ranges = []
+
+        # For each range, get completed addresses in ONE query
+        for range_start, range_end in ranges:
+            completed_addresses = set()
+
+            try:
                 result = conn.execute(
-                    """SELECT 1 FROM block_range_address_tracking
-                    WHERE pair_address = ? AND start_block = ? AND end_block = ? AND status = 'completed'""",
-                    (address, range_start, range_end),
-                ).fetchone()
+                    """SELECT pair_address FROM block_range_address_tracking
+                    WHERE start_block = ? AND end_block = ? AND status = 'completed'
+                    AND pair_address IN (SELECT address FROM temp_addresses)""",
+                    (range_start, range_end),
+                ).fetchall()
 
-                if not result:
-                    missing_addresses.append(address)
+                completed_addresses = {row[0] for row in result}
+            except:
+                pass
+
+            # Find missing addresses (set difference)
+            all_addresses_set = set(addresses)
+            missing_addresses = list(all_addresses_set - completed_addresses)
 
             if missing_addresses:
                 missing_ranges.append((range_start, range_end, missing_addresses))
+
+        # Cleanup
+        conn.execute("DROP TABLE temp_addresses")
 
         return missing_ranges
     finally:
@@ -1569,6 +1610,82 @@ def check_existing_events_for_range(start_block, end_block, addresses):
     This function is kept for backward compatibility
     """
     return is_block_range_analyzed_for_addresses(start_block, end_block, addresses)
+
+
+def calculate_price_from_sqrt(sqrt_price_x96):
+    if sqrt_price_x96 is None or sqrt_price_x96 == 0:
+        return None
+    try:
+        return (float(sqrt_price_x96) / (2 ** 96)) ** 2
+    except:
+        return None
+
+def safe_normalize(raw_value, decimals):
+    if raw_value is None or decimals is None:
+        return 0.0
+    try:
+        return float(raw_value) / (10 ** decimals)
+    except:
+        return 0.0
+
+def safe_str(value):
+    return str(value) if value is not None else None
+
+def _insert_one_by_one(conn, records, table_name, worker_id="main"):
+    sql_templates = {
+        "transfer": """INSERT INTO transfer
+            (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value_raw, value, abs_value, block_timestamp, token0_symbol, token1_symbol)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+        "swap": """INSERT INTO swap
+            (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0_raw, amount1_raw, amount0, amount1, abs_amount0, abs_amount1, sqrt_price_x96, liquidity, tick, price_token0_token1, block_timestamp, token0_symbol, token1_symbol)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+        "mint": """INSERT INTO mint
+            (transaction_hash, log_index, block_number, pair_address, owner, sender, tick_lower, tick_upper, amount_raw, amount0_raw, amount1_raw, amount, amount0, amount1, abs_amount0, abs_amount1, block_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+        "burn": """INSERT INTO burn
+            (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, amount_raw, amount0_raw, amount1_raw, amount, amount0, amount1, abs_amount0, abs_amount1, block_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+        "collect": """INSERT INTO collect
+            (transaction_hash, log_index, block_number, pair_address, owner, recipient, tick_lower, tick_upper, amount0_raw, amount1_raw, amount0, amount1, abs_amount0, abs_amount1, block_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+        "flash": """INSERT INTO flash
+            (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0_raw, amount1_raw, paid0_raw, paid1_raw, amount0, amount1, paid0, paid1, block_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+        "approval": """INSERT INTO approval
+            (transaction_hash, log_index, block_number, pair_address, owner, spender, value, block_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+    }
+
+    sql = sql_templates.get(table_name)
+    if not sql:
+        logging.error(f"[{worker_id}] Unknown table name: {table_name}")
+        return 0
+
+    success_count = 0
+    failed_count = 0
+
+    for record in records:
+        try:
+            conn.execute(sql, record)
+            success_count += 1
+        except Exception as e:
+            if "Conversion Error" in str(e) or "out of range" in str(e):
+                failed_count += 1
+            else:
+                logging.error(f"[{worker_id}] Unexpected error inserting {table_name} record: {e}")
+                failed_count += 1
+
+    if failed_count > 0:
+        logging.warning(f"[{worker_id}] Skipped {failed_count} {table_name} records with overflow values, inserted {success_count}")
+
+    return success_count
 
 
 def batch_insert_events(events, worker_id="main"):
@@ -1595,68 +1712,107 @@ def batch_insert_events(events, worker_id="main"):
         )
 
         if event_type == "Transfer":
+            value_raw = args.get("value")
+            value_norm = safe_normalize(value_raw, 18)
             transfers.append(
                 base_data
                 + (
                     args.get("from"),
                     args.get("to"),
-                    args.get("value"),
-                    None,
+                    safe_str(value_raw),
+                    value_norm,
+                    abs(value_norm),
                     None,
                     None,
                     None,
                 )
             )
         elif event_type == "Swap":
+            amount0_raw = args.get("amount0")
+            amount1_raw = args.get("amount1")
+            sqrt_price = args.get("sqrtPriceX96")
+
+            amount0_norm = safe_normalize(amount0_raw, 18)
+            amount1_norm = safe_normalize(amount1_raw, 18)
+
             swaps.append(
                 base_data
                 + (
                     args.get("sender"),
                     args.get("recipient"),
-                    args.get("amount0"),
-                    args.get("amount1"),
-                    args.get("sqrtPriceX96"),
-                    args.get("liquidity"),
+                    safe_str(amount0_raw),
+                    safe_str(amount1_raw),
+                    amount0_norm,
+                    amount1_norm,
+                    abs(amount0_norm),
+                    abs(amount1_norm),
+                    safe_str(sqrt_price),
+                    safe_str(args.get("liquidity")),
                     args.get("tick"),
-                    None,
-                    None,
+                    calculate_price_from_sqrt(sqrt_price),
                     None,
                     None,
                     None,
                 )
             )
         elif event_type == "Mint":
+            amount_raw = args.get("amount")
+            amount0_raw = args.get("amount0")
+            amount1_raw = args.get("amount1")
+
+            amount0_norm = safe_normalize(amount0_raw, 18)
+            amount1_norm = safe_normalize(amount1_raw, 18)
+
             mints.append(
                 base_data
                 + (
                     args.get("owner"),
+                    args.get("sender"),
                     args.get("tickLower"),
                     args.get("tickUpper"),
-                    args.get("sender"),
-                    args.get("amount"),
-                    args.get("amount0"),
-                    args.get("amount1"),
-                    None,
-                    None,
+                    safe_str(amount_raw),
+                    safe_str(amount0_raw),
+                    safe_str(amount1_raw),
+                    safe_normalize(amount_raw, 18),
+                    amount0_norm,
+                    amount1_norm,
+                    abs(amount0_norm),
+                    abs(amount1_norm),
                     None,
                 )
             )
         elif event_type == "Burn":
+            amount_raw = args.get("amount")
+            amount0_raw = args.get("amount0")
+            amount1_raw = args.get("amount1")
+
+            amount0_norm = safe_normalize(amount0_raw, 18)
+            amount1_norm = safe_normalize(amount1_raw, 18)
+
             burns.append(
                 base_data
                 + (
                     args.get("owner"),
                     args.get("tickLower"),
                     args.get("tickUpper"),
-                    args.get("amount"),
-                    args.get("amount0"),
-                    args.get("amount1"),
-                    None,
-                    None,
+                    safe_str(amount_raw),
+                    safe_str(amount0_raw),
+                    safe_str(amount1_raw),
+                    safe_normalize(amount_raw, 18),
+                    amount0_norm,
+                    amount1_norm,
+                    abs(amount0_norm),
+                    abs(amount1_norm),
                     None,
                 )
             )
         elif event_type == "Collect":
+            amount0_raw = args.get("amount0")
+            amount1_raw = args.get("amount1")
+
+            amount0_norm = safe_normalize(amount0_raw, 18)
+            amount1_norm = safe_normalize(amount1_raw, 18)
+
             collects.append(
                 base_data
                 + (
@@ -1664,23 +1820,34 @@ def batch_insert_events(events, worker_id="main"):
                     args.get("recipient"),
                     args.get("tickLower"),
                     args.get("tickUpper"),
-                    args.get("amount0"),
-                    args.get("amount1"),
-                    None,
-                    None,
+                    safe_str(amount0_raw),
+                    safe_str(amount1_raw),
+                    amount0_norm,
+                    amount1_norm,
+                    abs(amount0_norm),
+                    abs(amount1_norm),
                     None,
                 )
             )
         elif event_type == "Flash":
+            amount0_raw = args.get("amount0")
+            amount1_raw = args.get("amount1")
+            paid0_raw = args.get("paid0")
+            paid1_raw = args.get("paid1")
+
             flashes.append(
                 base_data
                 + (
                     args.get("sender"),
                     args.get("recipient"),
-                    args.get("amount0"),
-                    args.get("amount1"),
-                    args.get("paid0"),
-                    args.get("paid1"),
+                    safe_str(amount0_raw),
+                    safe_str(amount1_raw),
+                    safe_str(paid0_raw),
+                    safe_str(paid1_raw),
+                    safe_normalize(amount0_raw, 18),
+                    safe_normalize(amount1_raw, 18),
+                    safe_normalize(paid0_raw, 18),
+                    safe_normalize(paid1_raw, 18),
                     None,
                 )
             )
@@ -1692,8 +1859,6 @@ def batch_insert_events(events, worker_id="main"):
 
     conn = DB_POOL.get_connection()
     try:
-        # For DuckDB, we'll estimate insertions since changes() doesn't exist
-        # We'll count attempted insertions as a reasonable approximation
         total_attempted = (
             len(transfers)
             + len(swaps)
@@ -1704,72 +1869,137 @@ def batch_insert_events(events, worker_id="main"):
             + len(approvals)
         )
 
+        successfully_inserted = 0
+
         if transfers:
-            conn.executemany(
-                """INSERT INTO transfer
-                (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value, value_normalized, block_timestamp, token0_symbol, token1_symbol)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                transfers,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO transfer
+                    (transaction_hash, log_index, block_number, pair_address, from_address, to_address, value_raw, value, abs_value, block_timestamp, token0_symbol, token1_symbol)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    transfers,
+                )
+                successfully_inserted += len(transfers)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch transfer insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, transfers, "transfer", worker_id)
+                else:
+                    raise
 
         if swaps:
-            conn.executemany(
-                """INSERT INTO swap
-                (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick, amount0_normalized, amount1_normalized, block_timestamp, token0_symbol, token1_symbol)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                swaps,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO swap
+                    (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0_raw, amount1_raw, amount0, amount1, abs_amount0, abs_amount1, sqrt_price_x96, liquidity, tick, price_token0_token1, block_timestamp, token0_symbol, token1_symbol)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    swaps,
+                )
+                successfully_inserted += len(swaps)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch swap insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, swaps, "swap", worker_id)
+                else:
+                    raise
 
         if mints:
-            conn.executemany(
-                """INSERT INTO mint
-                (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, sender, amount, amount0, amount1, amount0_normalized, amount1_normalized, block_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                mints,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO mint
+                    (transaction_hash, log_index, block_number, pair_address, owner, sender, tick_lower, tick_upper, amount_raw, amount0_raw, amount1_raw, amount, amount0, amount1, abs_amount0, abs_amount1, block_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    mints,
+                )
+                successfully_inserted += len(mints)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch mint insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, mints, "mint", worker_id)
+                else:
+                    raise
 
         if burns:
-            conn.executemany(
-                """INSERT INTO burn
-                (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, amount, amount0, amount1, amount0_normalized, amount1_normalized, block_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                burns,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO burn
+                    (transaction_hash, log_index, block_number, pair_address, owner, tick_lower, tick_upper, amount_raw, amount0_raw, amount1_raw, amount, amount0, amount1, abs_amount0, abs_amount1, block_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    burns,
+                )
+                successfully_inserted += len(burns)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch burn insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, burns, "burn", worker_id)
+                else:
+                    raise
 
         if collects:
-            conn.executemany(
-                """INSERT INTO collect
-                (transaction_hash, log_index, block_number, pair_address, owner, recipient, tick_lower, tick_upper, amount0, amount1, amount0_normalized, amount1_normalized, block_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                collects,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO collect
+                    (transaction_hash, log_index, block_number, pair_address, owner, recipient, tick_lower, tick_upper, amount0_raw, amount1_raw, amount0, amount1, abs_amount0, abs_amount1, block_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    collects,
+                )
+                successfully_inserted += len(collects)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch collect insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, collects, "collect", worker_id)
+                else:
+                    raise
 
         if flashes:
-            conn.executemany(
-                """INSERT INTO flash
-                (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0, amount1, paid0, paid1, block_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                flashes,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO flash
+                    (transaction_hash, log_index, block_number, pair_address, sender, recipient, amount0_raw, amount1_raw, paid0_raw, paid1_raw, amount0, amount1, paid0, paid1, block_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    flashes,
+                )
+                successfully_inserted += len(flashes)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch flash insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, flashes, "flash", worker_id)
+                else:
+                    raise
 
         if approvals:
-            conn.executemany(
-                """INSERT INTO approval
-                (transaction_hash, log_index, block_number, pair_address, owner, spender, value, block_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
-                approvals,
-            )
+            try:
+                conn.executemany(
+                    """INSERT INTO approval
+                    (transaction_hash, log_index, block_number, pair_address, owner, spender, value, block_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (transaction_hash, log_index) DO NOTHING""",
+                    approvals,
+                )
+                successfully_inserted += len(approvals)
+            except Exception as e:
+                if "Conversion Error" in str(e) or "out of range" in str(e):
+                    logging.warning(f"[{worker_id}] Batch approval insert failed with conversion error, trying one-by-one")
+                    successfully_inserted += _insert_one_by_one(conn, approvals, "approval", worker_id)
+                else:
+                    raise
 
-        # Return total attempted since DuckDB doesn't have changes() function
-        # This is a reasonable approximation for logging purposes
-        return total_attempted
+        conn.commit()
+
+        if successfully_inserted > 0:
+            try:
+                total_swaps = conn.execute("SELECT COUNT(*) FROM swap").fetchone()[0]
+                logging.debug(f"[{worker_id}] Database now has {total_swaps:,} total swaps")
+            except:
+                pass
+
+        return successfully_inserted
     finally:
         DB_POOL.return_connection(conn)
 
@@ -1797,6 +2027,7 @@ def batch_insert_pair_metadata(pairs_data):
                 last_updated = NOW()""",
             pairs_data,
         )
+        conn.commit()  # Ensure pair metadata is committed to database
         return len(pairs_data)
     finally:
         DB_POOL.return_connection(conn)
@@ -1814,6 +2045,7 @@ def batch_insert_block_metadata(blocks_data):
             ON CONFLICT (block_number) DO NOTHING""",
             blocks_data,
         )
+        conn.commit()  # Ensure block metadata is committed to database
         return len(blocks_data)
     finally:
         DB_POOL.return_connection(conn)
@@ -1915,6 +2147,7 @@ def normalize_event_values(pair_address):
             (token0_decimals, token1_decimals, pair_address),
         )
 
+        conn.commit()
         return True
     finally:
         DB_POOL.return_connection(conn)
@@ -2314,28 +2547,31 @@ def _fetch_token_metadata_multicall(token_addresses, provider):
             logging.warning(f"Failed to decode {call_type} for {token_addr[:10]}: {e}")
 
     # Store successful results in cache
-    for token_addr, metadata in token_data.items():
-        if metadata.get("decimals") is not None:
-            # Store in database cache
-            conn = DB_POOL.get_connection()
-            conn.execute(
-                """
-                INSERT INTO token_metadata (token_address, symbol, name, decimals, is_valid)
-                VALUES (?, ?, ?, ?, true)
-                ON CONFLICT (token_address) DO UPDATE SET
-                    symbol = EXCLUDED.symbol,
-                    name = EXCLUDED.name,
-                    decimals = EXCLUDED.decimals,
-                    is_valid = true,
-                    last_updated = NOW()
-            """,
-                (
-                    token_addr,
-                    metadata.get("symbol"),
-                    metadata.get("name"),
-                    metadata.get("decimals"),
-                ),
-            )
+    conn = DB_POOL.get_connection()
+    try:
+        for token_addr, metadata in token_data.items():
+            if metadata.get("decimals") is not None:
+                conn.execute(
+                    """
+                    INSERT INTO token_metadata (token_address, symbol, name, decimals, is_valid)
+                    VALUES (?, ?, ?, ?, true)
+                    ON CONFLICT (token_address) DO UPDATE SET
+                        symbol = EXCLUDED.symbol,
+                        name = EXCLUDED.name,
+                        decimals = EXCLUDED.decimals,
+                        is_valid = true,
+                        last_updated = NOW()
+                """,
+                    (
+                        token_addr,
+                        metadata.get("symbol"),
+                        metadata.get("name"),
+                        metadata.get("decimals"),
+                    ),
+                )
+        conn.commit()
+    finally:
+        DB_POOL.return_connection(conn)
 
     # Combine cached and new results
     results = {}
@@ -2492,119 +2728,138 @@ def parallel_fetch_with_backoff(
 
 def update_pool_current_state(pool_address):
     conn = DB_POOL.get_connection()
-    latest_swap = conn.execute(
-        """SELECT sqrt_price_x96, tick, liquidity, block_number
-        FROM swap WHERE pair_address = ?
-        ORDER BY block_number DESC, log_index DESC LIMIT 1""",
-        (pool_address,),
-    ).fetchone()
+    try:
+        latest_swap = conn.execute(
+            """SELECT sqrt_price_x96, tick, liquidity, block_number
+            FROM swap WHERE pair_address = ?
+            ORDER BY block_number DESC, log_index DESC LIMIT 1""",
+            (pool_address,),
+        ).fetchone()
 
-    if not latest_swap:
-        return
+        if not latest_swap:
+            return
 
-    total_stats = conn.execute(
-        """SELECT COUNT(*) as total_swaps,
-        SUM(ABS(amount0_normalized)) as total_volume0,
-        SUM(ABS(amount1_normalized)) as total_volume1
-        FROM swap WHERE pair_address = ?""",
-        (pool_address,),
-    ).fetchone()
+        total_stats = conn.execute(
+            """SELECT COUNT(*) as total_swaps,
+            SUM(ABS(amount0_normalized)) as total_volume0,
+            SUM(ABS(amount1_normalized)) as total_volume1
+            FROM swap WHERE pair_address = ?""",
+            (pool_address,),
+        ).fetchone()
 
-    conn.execute(
-        """INSERT INTO pool_current_state (
-            pool_address, current_sqrt_price_x96, current_tick, current_liquidity,
-            last_swap_block, total_swaps, total_volume_token0, total_volume_token1, updated_at
-        ) VALUES (?, CAST(? AS HUGEINT), CAST(? AS HUGEINT), ?, ?, ?, ?, ?, NOW())
-        ON CONFLICT (pool_address) DO UPDATE SET
-            current_sqrt_price_x96 = EXCLUDED.current_sqrt_price_x96,
-            current_tick = EXCLUDED.current_tick,
-            current_liquidity = EXCLUDED.current_liquidity,
-            last_swap_block = EXCLUDED.last_swap_block,
-            total_swaps = EXCLUDED.total_swaps,
-            total_volume_token0 = EXCLUDED.total_volume_token0,
-            total_volume_token1 = EXCLUDED.total_volume_token1,
-            updated_at = NOW()""",
-        (
-            pool_address,
-            latest_swap[0],
-            latest_swap[1],
-            latest_swap[2],
-            latest_swap[3],
-            total_stats[0],
-            total_stats[1],
-            total_stats[2],
-        ),
-    )
+        conn.execute(
+            """INSERT INTO pool_current_state (
+                pool_address, current_sqrt_price_x96, current_tick, current_liquidity,
+                last_swap_block, total_swaps, total_volume_token0, total_volume_token1, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            ON CONFLICT (pool_address) DO UPDATE SET
+                current_sqrt_price_x96 = EXCLUDED.current_sqrt_price_x96,
+                current_tick = EXCLUDED.current_tick,
+                current_liquidity = EXCLUDED.current_liquidity,
+                last_swap_block = EXCLUDED.last_swap_block,
+                total_swaps = EXCLUDED.total_swaps,
+                total_volume_token0 = EXCLUDED.total_volume_token0,
+                total_volume_token1 = EXCLUDED.total_volume_token1,
+                updated_at = NOW()""",
+            (
+                pool_address,
+                str(latest_swap[0]) if latest_swap[0] is not None else None,
+                latest_swap[1],
+                str(latest_swap[2]) if latest_swap[2] is not None else None,
+                latest_swap[3],
+                total_stats[0],
+                total_stats[1],
+                total_stats[2],
+            ),
+        )
+        conn.commit()
+    finally:
+        DB_POOL.return_connection(conn)
 
 
 def denormalize_timestamps():
     conn = DB_POOL.get_connection()
-    logging.info("Denormalizing timestamps...")
+    try:
+        logging.info("Denormalizing timestamps...")
 
-    conn.execute(
-        """UPDATE swap s SET block_timestamp = b.block_timestamp
-        FROM block_metadata b WHERE s.block_number = b.block_number AND s.block_timestamp IS NULL"""
-    )
+        conn.execute(
+            """UPDATE swap s SET block_timestamp = b.block_timestamp
+            FROM block_metadata b WHERE s.block_number = b.block_number AND s.block_timestamp IS NULL"""
+        )
 
-    conn.execute(
-        """UPDATE mint m SET block_timestamp = b.block_timestamp
-        FROM block_metadata b WHERE m.block_number = b.block_number AND m.block_timestamp IS NULL"""
-    )
+        conn.execute(
+            """UPDATE mint m SET block_timestamp = b.block_timestamp
+            FROM block_metadata b WHERE m.block_number = b.block_number AND m.block_timestamp IS NULL"""
+        )
 
-    conn.execute(
-        """UPDATE burn bn SET block_timestamp = b.block_timestamp
-        FROM block_metadata b WHERE bn.block_number = b.block_number AND bn.block_timestamp IS NULL"""
-    )
+        conn.execute(
+            """UPDATE burn bn SET block_timestamp = b.block_timestamp
+            FROM block_metadata b WHERE bn.block_number = b.block_number AND bn.block_timestamp IS NULL"""
+        )
 
-    logging.info("✓ Timestamps denormalized")
+        conn.commit()
+        logging.info("✓ Timestamps denormalized")
+    finally:
+        DB_POOL.return_connection(conn)
 
 
 def denormalize_pair_symbols():
     conn = DB_POOL.get_connection()
-    logging.info("Denormalizing pair symbols...")
+    try:
+        logging.info("Denormalizing pair symbols...")
 
-    conn.execute(
-        """UPDATE swap s SET token0_symbol = pm.token0_symbol, token1_symbol = pm.token1_symbol
-        FROM pair_metadata pm WHERE s.pair_address = pm.pair_address AND s.token0_symbol IS NULL"""
-    )
+        conn.execute(
+            """UPDATE swap s SET token0_symbol = pm.token0_symbol, token1_symbol = pm.token1_symbol
+            FROM pair_metadata pm WHERE s.pair_address = pm.pair_address AND s.token0_symbol IS NULL"""
+        )
 
-    logging.info("✓ Pair symbols denormalized")
+        conn.commit()
+        logging.info("✓ Pair symbols denormalized")
+    finally:
+        DB_POOL.return_connection(conn)
 
 
 def refresh_pool_summary():
     conn = DB_POOL.get_connection()
-    logging.info("Refreshing pool summary...")
+    try:
+        logging.info("Refreshing pool summary...")
 
-    conn.execute("DROP TABLE IF EXISTS pool_summary")
-    conn.execute(
-        """CREATE TABLE pool_summary AS
-        SELECT pm.pair_address, pm.token0_symbol, pm.token1_symbol, pm.token0_decimals, pm.token1_decimals, pm.fee_tier,
-            COUNT(DISTINCT s.transaction_hash) as total_swaps,
-            COUNT(DISTINCT m.transaction_hash) as total_mints,
-            COUNT(DISTINCT b.transaction_hash) as total_burns,
-            SUM(ABS(s.amount0_normalized)) as total_volume_token0,
-            SUM(ABS(s.amount1_normalized)) as total_volume_token1,
-            MIN(s.block_number) as first_swap_block,
-            MAX(s.block_number) as last_swap_block
-        FROM pair_metadata pm
-        LEFT JOIN swap s ON pm.pair_address = s.pair_address
-        LEFT JOIN mint m ON pm.pair_address = m.pair_address
-        LEFT JOIN burn b ON pm.pair_address = b.pair_address
-        GROUP BY pm.pair_address, pm.token0_symbol, pm.token1_symbol, pm.token0_decimals, pm.token1_decimals, pm.fee_tier"""
-    )
+        conn.execute("DROP TABLE IF EXISTS pool_summary")
+        conn.execute(
+            """CREATE TABLE pool_summary AS
+            SELECT pm.pair_address, pm.token0_symbol, pm.token1_symbol, pm.token0_decimals, pm.token1_decimals, pm.fee_tier,
+                COUNT(DISTINCT s.transaction_hash) as total_swaps,
+                COUNT(DISTINCT m.transaction_hash) as total_mints,
+                COUNT(DISTINCT b.transaction_hash) as total_burns,
+                SUM(ABS(s.amount0_normalized)) as total_volume_token0,
+                SUM(ABS(s.amount1_normalized)) as total_volume_token1,
+                MIN(s.block_number) as first_swap_block,
+                MAX(s.block_number) as last_swap_block
+            FROM pair_metadata pm
+            LEFT JOIN swap s ON pm.pair_address = s.pair_address
+            LEFT JOIN mint m ON pm.pair_address = m.pair_address
+            LEFT JOIN burn b ON pm.pair_address = b.pair_address
+            GROUP BY pm.pair_address, pm.token0_symbol, pm.token1_symbol, pm.token0_decimals, pm.token1_decimals, pm.fee_tier"""
+        )
 
-    conn.execute(
-        "CREATE INDEX idx_pool_summary_volume ON pool_summary(total_volume_token0)"
-    )
-    conn.execute("CREATE INDEX idx_pool_summary_swaps ON pool_summary(total_swaps)")
-    logging.info("✓ Pool summary refreshed")
+        conn.execute(
+            "CREATE INDEX idx_pool_summary_volume ON pool_summary(total_volume_token0)"
+        )
+        conn.execute("CREATE INDEX idx_pool_summary_swaps ON pool_summary(total_swaps)")
+        conn.commit()
+        logging.info("✓ Pool summary refreshed")
+    finally:
+        DB_POOL.return_connection(conn)
 
 
 def aggregate_all_pools(max_workers=8):
     conn = DB_POOL.get_connection()
-    pools = conn.execute("SELECT DISTINCT pair_address FROM swap").fetchall()
-    pools = [p[0] for p in pools]
-    logging.info(f"Aggregating stats for {len(pools)} pools...")
+    try:
+        pools = conn.execute("SELECT DISTINCT pair_address FROM swap").fetchall()
+        pools = [p[0] for p in pools]
+        logging.info(f"Aggregating stats for {len(pools)} pools...")
+    finally:
+        DB_POOL.return_connection(conn)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(update_pool_current_state, pool) for pool in pools]
